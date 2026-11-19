@@ -2,7 +2,7 @@
 """The deterministic gate: does the job's branch pass the repo's checks?
 
 Usage:
-  gate <job-id>            write round-N/checks.md; exit 0 on PASS, 1 on FAIL
+  gate <job-id>            write round-N/checks.md; exit 0 on PASS, 1 on FAIL, 3 on INCONCLUSIVE
   gate <job-id> --merge    same, as round-N/merge-checks.md (job merge runs it)
   gate --hook              builder SubagentStop hook: run the checks once, exit 2 on failure
 
@@ -12,6 +12,11 @@ branch modifies or deletes a file matching config.json `protected_paths`
 (fnmatch patterns, where `*` also matches `/`, matched case-insensitively).
 Adding new files is fine, except under `protected_trees`, where an addition
 (or a rename into the tree) fails too.
+
+checks.sh exit 75 (EX_TEMPFAIL: a tool is unavailable, a test is flaky), or a
+checks command that can't run at all (126, 127), gives INCONCLUSIVE: not a
+failure, the job reruns the gate once, then escalates (spec §6). A protected
+path change is a FAIL whatever the checks say.
 
 Each verdict appends a line to factory/jobs/<job-id>/trace.jsonl: the gate's
 command, the checks command and its directory, exit codes, verdict and the
@@ -31,6 +36,8 @@ FACTORY = REPO / "factory"
 CONFIG = json.loads((FACTORY / "config.json").read_text())
 CHECKS = FACTORY / "checks.sh"
 TAIL = 80
+INCONCLUSIVE_EXITS = {75, 126, 127}
+EXIT_CODES = {"PASS": 0, "FAIL": 1, "INCONCLUSIVE": 3}
 
 
 def die(msg):
@@ -109,11 +116,14 @@ def gate(job_id, merge):
     protected = protected_changes(worktree)
     code, log, seconds = run_checks(worktree)
     verdict = "PASS" if code == 0 and not protected else "FAIL"
+    if verdict == "FAIL" and not protected and code in INCONCLUSIVE_EXITS:
+        verdict = "INCONCLUSIVE"
     name = "merge-checks" if merge else "checks"
     (round_dir / f"{name}.log").write_text(log)
     tail = "\n".join(log.rstrip().splitlines()[-TAIL:])
     summary = [
-        f"checks.sh {'passed' if code == 0 else f'failed with exit {code}'} in {seconds}s",
+        f"checks.sh {'passed' if code == 0 else f'failed with exit {code}'} in {seconds}s"
+        + (" (inconclusive: a tool is unavailable or a test is flaky)" if verdict == "INCONCLUSIVE" else ""),
         f"Protected paths: {'changed: ' + ', '.join(protected) if protected else 'none changed'}",
         f"Commit {commit[:7]}" + (", synced with the latest main before merging" if merge else ""),
     ]
@@ -124,7 +134,7 @@ def gate(job_id, merge):
         + ("\n".join(f"- {p}" for p in protected) if protected else "None changed.")
         + f"\n\n## checks.sh\nExit {code} in {seconds}s. Last {TAIL} lines of {name}.log:\n\n```\n{tail}\n```\n"
     )
-    exit_code = 0 if verdict == "PASS" else 1
+    exit_code = EXIT_CODES[verdict]
     trace = {
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "control": "gate",

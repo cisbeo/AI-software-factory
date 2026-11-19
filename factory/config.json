@@ -1,6 +1,8 @@
 {
   "concurrency": 1,
-  "max_rounds": 3,
+  "retry_budget": 3,
+  "max_cost_usd": 25,
+  "max_duration_minutes": 480,
   "base_branch": "main",
   "merge_method": "merge",
   "auto_merge": "never",

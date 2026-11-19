@@ -172,6 +172,49 @@ class BaseChecksFail(GateCase):
         self.assert_verdict(self.gate(), "FAIL")
 
 
+TEMPFAIL_CHECKS = "#!/usr/bin/env bash\necho BASE-CHECKS tool unavailable\nexit 75\n"
+
+
+class Inconclusive(GateCase):
+    """checks.sh exit 75 (EX_TEMPFAIL: a tool is unavailable, a test is flaky)
+    or a checks command that can't run (126, 127) gives GATE: INCONCLUSIVE,
+    exit 3: not a failure; `job` reruns the gate once, then escalates."""
+
+    base_checks = TEMPFAIL_CHECKS
+
+    def assert_inconclusive(self, res):
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        self.assertIn("GATE: INCONCLUSIVE", res.stdout)
+        self.assertTrue(self.checks_md().startswith("GATE: INCONCLUSIVE\n"))
+
+    # ---- inconclusive ----
+
+    def test_tempfail_is_inconclusive(self):
+        self.commit_on_branch({"src/app.txt": "v2\n"})
+        self.assert_inconclusive(self.gate())
+        [t] = self.traces()
+        self.assertEqual((t["verdict"], t["exit"], t["checks_exit"]), ("INCONCLUSIVE", 3, 75))
+
+    def test_missing_checks_script_is_inconclusive(self):
+        (self.factory / "checks.sh").unlink()
+        self.commit_on_branch({"src/app.txt": "v2\n"})
+        self.assert_inconclusive(self.gate())
+
+    # ---- blocked: a protected change is a failure whatever the checks say ----
+
+    def test_protected_change_fails_even_when_checks_are_inconclusive(self):
+        self.commit_on_branch({"AGENTS.md": "edited\n"})
+        self.assert_verdict(self.gate(), "FAIL")
+
+    # ---- neighbour: any other non-zero exit is a plain failure ----
+
+    def test_other_exit_codes_fail(self):
+        for code in (1, 2, 74, 76, 125, 128):
+            with self.subTest(code=code):
+                write(self.factory / "checks.sh", f"#!/usr/bin/env bash\nexit {code}\n", mode=0o755)
+                self.assert_verdict(self.gate(), "FAIL")
+
+
 class Trace(GateCase):
     def test_pass_leaves_a_trace(self):
         head = self.commit_on_branch({"src/app.txt": "v2\n"})
