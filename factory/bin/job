@@ -2,7 +2,7 @@
 """The only writer of factory/jobs/<job-id>/job.json.
 
 Every stage change goes through `advance`, which checks the files that justify
-it and refuses anything else. GitHub side effects that belong to a transition
+it and refuses anything else. Forge side effects that belong to a transition
 (labels, comments, the worktree, the merge) happen here too, so the
 orchestrator never improvises them.
 
@@ -52,7 +52,7 @@ TRANSITIONS = {
     "needs-human": {"build", "rejected"},
 }
 TERMINAL = {"merged", "rejected"}
-# Any unfinished job can move to merged once its PR is merged on GitHub,
+# Any unfinished job can move to merged once its PR is merged on the forge,
 # whether the factory merged it or a person did mid-round.
 WAITING = {"needs-info", "needs-human"}
 CONCURRENCY = CONFIG["concurrency"]
@@ -78,22 +78,23 @@ def run(cmd, cwd=REPO, check=True):
     return res
 
 
-def gh(*args):
-    return run(["gh", *args]).stdout
+def forge(*args):
+    """The forge (GitHub, GitLab) only through factory/bin/forge (spec §10)."""
+    return run([str(BIN / "forge"), *[str(a) for a in args]]).stdout
 
 
-def gh_json(*args):
-    return json.loads(gh(*args))
+def forge_json(*args):
+    return json.loads(forge(*args))
 
 
 _operator = None
 
 
 def operator():
-    """The GitHub user running the factory. Its comments carry MARKER."""
+    """The forge user running the factory. Its comments carry MARKER."""
     global _operator
     if _operator is None:
-        _operator = gh("api", "user", "--jq", ".login").strip()
+        _operator = forge_json("whoami")["login"]
     return _operator
 
 
@@ -205,13 +206,13 @@ def quote(text):
 
 
 def fetch_issue(number):
-    return gh_json("issue", "view", str(number), "--json",
-                   "number,title,body,author,labels,state,url,comments")
+    """The ticket, with only its author's and the operator's comments."""
+    return forge_json("ticket", "view", number)
 
 
 def write_issue_md(job):
     issue = fetch_issue(job["issue"])
-    author = issue["author"]["login"]
+    author = issue["author"]
     trusted = {author, operator()}
     lines = [
         f"# Issue #{issue['number']}: {issue['title']}",
@@ -226,13 +227,13 @@ def write_issue_md(job):
         "",
         quote(issue["body"] or ""),
     ]
-    comments = [c for c in issue["comments"] if c["author"]["login"] in trusted]
+    comments = [c for c in issue["comments"] if c["author"] in trusted]
     if comments:
         lines += ["", "## Comments"]
         for c in comments:
-            who = "factory" if c["body"].startswith(MARKER) else f"@{c['author']['login']}"
+            who = "factory" if c["body"].startswith(MARKER) else f"@{c['author']}"
             body = c["body"].removeprefix(MARKER)
-            lines += ["", f"### {who}, {c['createdAt']}", "", quote(body)]
+            lines += ["", f"### {who}, {c['created_at']}", "", quote(body)]
     (job_dir(job["id"]) / "issue.md").write_text("\n".join(lines) + "\n")
     return issue
 
@@ -243,23 +244,24 @@ def replied_since_question(issue):
     replied = False
     for c in issue["comments"]:
         if c["body"].startswith(MARKER):
-            last_factory, replied = c["createdAt"], False
-        elif last_factory and c["author"]["login"] in {issue["author"]["login"], operator()}:
+            last_factory, replied = c["created_at"], False
+        elif last_factory and c["author"] in {issue["author"], operator()}:
             replied = True
     return replied
 
 
 def comment(kind, number, body):
-    gh(kind, "comment", str(number), "--body", f"{MARKER}\n{body}")
+    """kind: `ticket` or `mr` (merge request)."""
+    forge(kind, "comment", number, "--body", f"{MARKER}\n{body}")
 
 
-def label(kind, number, add=None, remove=None):
-    args = [kind, "edit", str(number)]
+def label(number, add=None, remove=None):
+    args = ["ticket", "label", number]
     if add:
-        args += ["--add-label", add]
+        args += ["--add", add]
     if remove:
-        args += ["--remove-label", remove]
-    gh(*args)
+        args += ["--remove", remove]
+    forge(*args)
 
 
 # ---- Cost from Claude Code transcripts -------------------------------------
@@ -377,7 +379,7 @@ def pr_door(job):
     (even identical ones) give None, so a body can't smuggle in a second line."""
     if not job.get("pr"):
         return None
-    body = gh_json("pr", "view", str(job["pr"]), "--json", "body")["body"] or ""
+    body = forge_json("mr", "view", job["pr"])["body"] or ""
     body = re.sub(r"^(```|~~~).*?^\1[^\n]*$", "", body, flags=re.M | re.S)
     found = re.findall(r"^\*\*Door:\*\* (one-way|two-way)$", body, re.M)
     return found[0] if len(found) == 1 else None
@@ -393,7 +395,8 @@ def git(job, *args, check=True):
 
 
 def pr_state(job):
-    return gh_json("pr", "view", str(job["pr"]), "--json", "state")["state"]
+    """open, closed or merged."""
+    return forge_json("mr", "view", job["pr"])["state"]
 
 
 def check_reviews_done(job):
@@ -420,18 +423,18 @@ def advance(job, stage):
     intake_body = lambda: "\n".join((d / "intake.md").read_text().split("\n\n", 1)[1:]).strip()
 
     if stage == "merged":
-        require(job["pr"] and pr_state(job) == "MERGED", "the PR isn't merged")
+        require(job["pr"] and pr_state(job) == "merged", "the PR isn't merged")
         if old == "needs-human":
-            label("issue", job["issue"], remove=LABELS["needs_human"])
+            label(job["issue"], remove=LABELS["needs_human"])
 
     elif stage == "rejected" and old in WAITING:
         require((d / "rejection.md").exists(), "use `job reject` to reject a waiting job")
         reason = (d / "rejection.md").read_text().split("\n", 1)[1].strip()
-        comment("issue", job["issue"], f"### Factory: rejected\n\n{reason}")
+        comment("ticket", job["issue"], f"### Factory: rejected\n\n{reason}")
         waiting = LABELS["needs_info"] if old == "needs-info" else LABELS["needs_human"]
-        label("issue", job["issue"], remove=f"{LABELS['queue']},{waiting}")
+        label(job["issue"], remove=f"{LABELS['queue']},{waiting}")
         if job["pr"]:
-            gh("pr", "close", str(job["pr"]))
+            forge("mr", "close", job["pr"])
             run(["git", "push", "origin", "--delete", job["branch"]], check=False)
 
     elif old == "intake":
@@ -442,11 +445,11 @@ def advance(job, stage):
             require(job["agents"], "route the job first: factory/bin/route " + job["id"])
             i = job["intake"]
             title += f" (risk {i['risk']}, surfaces: {', '.join(i['surfaces']) or 'none'})"
-        comment("issue", job["issue"], f"{title}\n\n{intake_body()}")
+        comment("ticket", job["issue"], f"{title}\n\n{intake_body()}")
         if stage == "needs-info":
-            label("issue", job["issue"], add=LABELS["needs_info"])
+            label(job["issue"], add=LABELS["needs_info"])
         elif stage == "rejected":
-            label("issue", job["issue"], remove=LABELS["queue"])
+            label(job["issue"], remove=LABELS["queue"])
         else:
             run(["git", "fetch", "origin", BASE])
             Path(job["worktree"]).parent.mkdir(parents=True, exist_ok=True)
@@ -458,7 +461,7 @@ def advance(job, stage):
         (d / "intake.md").rename(d / f"intake-{k}.md")
         job["intake"] = None
         write_issue_md(job)
-        label("issue", job["issue"], remove=LABELS["needs_info"])
+        label(job["issue"], remove=LABELS["needs_info"])
 
     elif old == "spec":
         require((d / "spec.md").exists(), "spec.md doesn't exist")
@@ -477,9 +480,9 @@ def advance(job, stage):
         remote = res.stdout.strip() if res.returncode == 0 else ""
         require(head == remote, f"{job['branch']} isn't pushed: local {head[:7]}, origin {remote[:7] or 'missing'}")
         if not job["pr"]:
-            prs = gh_json("pr", "list", "--head", job["branch"], "--state", "open", "--json", "number,url")
-            require(len(prs) == 1, f"expected one open PR from {job['branch']}, found {len(prs)}")
-            job["pr"], job["pr_url"] = prs[0]["number"], prs[0]["url"]
+            mr = forge_json("mr", "find", "--head", job["branch"])
+            require(mr, f"no open merge request from {job['branch']}")
+            job["pr"], job["pr_url"] = mr["number"], mr["url"]
 
     elif old == "build":  # → needs-human
         status = first_line(d / "build.md")
@@ -533,17 +536,16 @@ def advance(job, stage):
                 "use `job feedback` to send a job back to the builder")
         job["round_limit"] = job["round"] + CONFIG["max_rounds"]
         next_round(job)
-        label("issue", job["issue"], remove=LABELS["needs_human"])
+        label(job["issue"], remove=LABELS["needs_human"])
 
     if stage == "needs-human":
         body = f"### Factory: needs a human\n\n{(d / 'decision.md').read_text().split(chr(10), 1)[1].strip()}"
         if job["pr"]:
-            if gh_json("pr", "view", str(job["pr"]), "--json", "isDraft")["isDraft"]:
-                gh("pr", "ready", str(job["pr"]))
-            comment("pr", job["pr"], body)
+            forge("mr", "ready", job["pr"])
+            comment("mr", job["pr"], body)
         else:
-            comment("issue", job["issue"], body)
-        label("issue", job["issue"], add=LABELS["needs_human"])
+            comment("ticket", job["issue"], body)
+        label(job["issue"], add=LABELS["needs_human"])
 
     if stage in TERMINAL and Path(job["worktree"]).exists():
         run(["git", "worktree", "remove", "--force", job["worktree"]])
@@ -571,9 +573,9 @@ def cmd_create(number):
     except Refused as e:
         die(str(e))
     issue = fetch_issue(number)
-    if issue["state"] != "OPEN":
-        die(f"issue #{number} is {issue['state'].lower()}")
-    if LABELS["queue"] not in {l["name"] for l in issue["labels"]}:
+    if issue["state"] != "open":
+        die(f"issue #{number} is {issue['state']}")
+    if LABELS["queue"] not in issue["labels"]:
         die(f"issue #{number} isn't labeled {LABELS['queue']}")
     try:
         blockers = open_blockers(issue["number"])
@@ -601,17 +603,9 @@ def cmd_create(number):
 
 
 def open_blockers(issue):
-    """Numbers of the open issues that block this one (GitHub issue dependencies).
-
-    Refuses when GitHub doesn't say: starting a ticket that may be blocked costs
-    a whole job, waiting for the next `queue` costs nothing."""
-    summary = gh_json("api", f"repos/{{owner}}/{{repo}}/issues/{issue}").get("issue_dependencies_summary")
-    if summary is None:
-        raise Refused(f"GitHub gave no dependency information for issue #{issue}")
-    if not summary["blocked_by"]:
-        return []
-    blockers = gh_json("api", f"repos/{{owner}}/{{repo}}/issues/{issue}/dependencies/blocked_by")
-    return sorted(b["number"] for b in blockers if b["state"] == "open")
+    """Numbers of the open tickets that block this one: the forge's « blocked by »
+    relation, or the written « Bloqué par #n » convention (factory/bin/forge)."""
+    return forge_json("blockers", issue)
 
 
 def cmd_queue():
@@ -620,19 +614,18 @@ def cmd_queue():
     A new issue with an open blocker is `blocked` and takes no slot; the next
     `queue`, after the blocker is closed, lets it through."""
     jobs = {j["issue"]: j for j in all_jobs()}
-    # A job is done once its PR is merged on GitHub, which also closes the issue.
+    # A job is done once its PR is merged on the forge, which also closes the issue.
     for j in jobs.values():
-        if j["stage"] not in TERMINAL and j["pr"] and pr_state(j) == "MERGED":
+        if j["stage"] not in TERMINAL and j["pr"] and pr_state(j) == "merged":
             save(advance(sync(j), "merged"))
-    issues = gh_json("issue", "list", "--label", LABELS["queue"], "--state", "open",
-                     "--limit", "200", "--json", "number,title")
+    issues = forge_json("tickets", "--label", LABELS["queue"])
     open_numbers = {i["number"] for i in issues}
     running_rows, replied_rows, new_rows, other_rows = [], [], [], []
     for issue in sorted(issues, key=lambda i: i["number"]):
         n = issue["number"]
         j = jobs.get(n)
         if not j:
-            blockers = open_blockers(n)
+            blockers = issue["blockers"]
             if blockers:
                 other_rows.append(("blocked", n, "-", "-", "blocked by " + ", ".join(f"#{b}" for b in blockers)))
             else:
@@ -673,7 +666,7 @@ def cmd_merge(job):
         save(advance(job, "merging"))
     if job["stage"] != "merging":
         die(f"{job['id']} is in {job['stage']}, not approve or merging")
-    if job["pr"] and pr_state(job) == "MERGED":
+    if job["pr"] and pr_state(job) == "merged":
         save(advance(sync(job), "merged"))
         print(f"{job['id']}: merged PR #{job['pr']}")
         return
@@ -704,9 +697,11 @@ def cmd_merge(job):
                     f"See round-{job['round']}/merge-checks.md.\n\n{gate.stdout.strip()}")
     try:
         git(job, "push", "origin", job["branch"])
-        if gh_json("pr", "view", str(job["pr"]), "--json", "isDraft")["isDraft"]:
-            gh("pr", "ready", str(job["pr"]))
-        gh("pr", "merge", str(job["pr"]), f"--{CONFIG['merge_method']}")
+        # Merge only the commit the gate just checked: the forge refuses if the
+        # request's head moved since.
+        head = git(job, "rev-parse", "HEAD").stdout.strip()
+        forge("mr", "ready", job["pr"])
+        forge("mr", "merge", job["pr"], "--head", head, "--method", CONFIG["merge_method"])
     except Refused as e:
         return fail(f"The merge failed:\n\n```\n{e}\n```")
     # GitHub may already have deleted the branch on merge.

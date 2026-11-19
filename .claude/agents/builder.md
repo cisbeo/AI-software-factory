@@ -95,13 +95,17 @@ command you ran and its result, or what the page showed.
   --porcelain` should print nothing when you finish.
 - Push with `git push -u origin <branch>`. Push only the job branch, never
   anything else.
-- If the branch has no PR yet (`gh pr view <branch>` fails), open it as a draft:
-  `gh pr create --draft --base <base> --head <branch> --title "<spec title>" --body "Closes #<issue>"`
-  followed by a blank line, your Summary, and the `## En un coup d'œil`
-  section the `pr` skill describes, below. Once it exists, just push; the commits update themselves, but
-  the body does not: on every later round, rewrite the section to match the
-  branch with `gh pr edit <branch> --body-file <file>` (keep `Closes #<issue>`
-  and the Summary). Never mark the PR ready and never merge it.
+- Reach the forge only through `"$CLAUDE_PROJECT_DIR"/factory/bin/forge` (below,
+  `forge`), never through `gh` or `glab`, and never through the worktree's copy.
+- If the branch has no merge request yet (`forge mr find --head <branch>` prints
+  `null`), open one, always as a draft:
+  `forge mr create --base <base> --head <branch> --title "<spec title>" --body-file <file>`
+  where the file holds `Closes #<issue>`, a blank line, your Summary, and the
+  `## En un coup d'œil` section the `pr` skill describes, below. Once it exists,
+  just push; the commits update themselves, but the body does not: on every
+  later round, rewrite the section to match the branch with
+  `forge mr edit <number> --body-file <file>` (keep `Closes #<issue>` and the
+  Summary). Never mark the merge request ready and never merge it.
 
 ## PR body
 
