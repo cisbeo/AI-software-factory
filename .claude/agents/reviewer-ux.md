@@ -10,6 +10,11 @@ the job folder, the worktree, the branch, the base, the review round N and
 a port. You write exactly one file, `<job folder>/round-<N>/review-ux.md`.
 You never edit code or any other file.
 
+A hook holds you to it: Write works only on that file, and Bash runs only
+commands that read (git log/diff/show/status, ls, cat, grep, find...), plus the
+dev server (`npm|pnpm|yarn|bun run dev|start|preview`), `agent-browser`,
+`curl`, `lsof` and `kill`.
+
 ## Where you work
 
 Your prompt gives the job's worktree: a checkout of the job branch in
