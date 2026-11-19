@@ -8,6 +8,7 @@ rewrites after each call. Errors look like gh's: a JSON body on stdout,
 
 State keys: user, next, issues, comments, deps, deps_unavailable, pulls,
 check_runs, statuses, reviews, protection, rules, rules_error, pulls_error,
+labels (the repository's labels: name, color, description),
 permissions (the account's rights on the repository; absent means full rights,
 null means the answer carries none), unauthenticated.
 """
@@ -66,6 +67,25 @@ def route(state, method, path, query, payload):
         if perms is not None:
             repo["permissions"] = perms
         return repo
+
+    if rest == "labels" and method == "GET":
+        return state.setdefault("labels", [])
+    if rest == "labels" and method == "POST":
+        labels = state.setdefault("labels", [])
+        if any(l["name"].lower() == payload["name"].lower() for l in labels):
+            raise HttpError(422, "Validation Failed: already_exists")
+        label = {"name": payload["name"], "color": payload.get("color", "ededed"),
+                 "description": payload.get("description", "")}
+        labels.append(label)
+        return label
+    if mm := re.fullmatch(r"labels/(.+)", rest):
+        name = unquote(mm.group(1))
+        labels = state.setdefault("labels", [])
+        if method == "DELETE":
+            if not any(l["name"] == name for l in labels):
+                raise HttpError(404, "Not Found")
+            state["labels"] = [l for l in labels if l["name"] != name]
+            return None
 
     if rest == "issues" and method == "GET":
         want_state = query.get("state", "open")

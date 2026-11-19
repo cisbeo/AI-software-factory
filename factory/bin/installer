@@ -1,0 +1,1162 @@
+#!/usr/bin/env python3
+"""factory discover | install | uninstall (spec §11.2, §11.3, §11.6; ADR 0004, 0007).
+
+Usage:
+  installer discover  [--target DIR] [--answer KEY=VALUE]... [--dry-run]
+  installer install   [--target DIR] [--answer KEY=VALUE]... [--overwrite PATH]... [--dry-run]
+  installer uninstall [--target DIR] [--dry-run]
+
+The target is a new repository (palier 1, ADR 0004); default: the current
+directory. The factory installed is this checkout's last commit, read from git:
+a source with uncommitted changes to what it installs isn't pinned and is refused.
+
+discover — read-only survey of the target (forge from `git remote`, new or
+existing repository, stack and its install/lint/typecheck/test/build commands,
+CI, agent instructions, Claude settings, git hooks, base branch protection and
+the account's rights through factory/bin/forge, comment-triggered automations,
+secret files tracked by git), then the questions of §11.2. Each question
+proposes the detected value; an empty line accepts it. The answers go to
+factory/answers.json, committed with the rest, so a later run asks nothing.
+Then the readiness report (ready, risky, blocking) and the install plan.
+
+install — runs factory/bin/doctor on the target first, then discovery, then
+the plan: every file created or replaced, every label. With --dry-run it stops
+there and writes nothing. Otherwise it applies the plan and nothing else:
+- a file that doesn't exist is created;
+- an identical file is left alone and not claimed;
+- a different existing file is replaced only with its own consent: answer `o`
+  when asked, or name it with --overwrite PATH; the original is kept under
+  factory/install-backup/ for uninstall. Without consent it is kept as is and
+  the install ends INCOMPLET.
+It writes the journal factory/install-log.json (factory version, source commit,
+pinned external sources, each file with its sha256, the labels it created).
+A second run only reports the differences.
+
+uninstall — removes what the journal lists: created files are deleted, replaced
+files restored from their backup, created labels deleted. A file changed since
+the install is kept and reported. A journal it doesn't fully understand
+(unknown field, path outside the repository) stops it before anything is removed.
+
+Answers (--answer KEY=VALUE; the questions use the same keys):
+  forge                github | gitlab
+  forge_instance       GitLab only: https://gitlab.com or the instance's address
+  forge_plan           github: free|pro|team|enterprise; gitlab: free|premium|ultimate
+  tier                 1 | 2 | 3 (only 1 is installable today)
+  deploy_target        where the product is deployed, or « aucune »
+  retry_budget         whole number ≥ 1
+  max_cost_usd         number > 0
+  max_waiting_for_human  whole number ≥ 1
+  base_branch          the base branch
+  command.<kind>       replaces the surveyed command (kind: install, lint,
+                       typecheck, test, build); « aucune » drops it
+
+Exit status: 0 done, 1 blocked / refused / incomplete, 2 usage error.
+"""
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path, PurePosixPath
+
+FACTORY = Path(__file__).resolve().parents[1]
+SOURCE = FACTORY.parent
+FORGE = FACTORY / "bin" / "forge"
+DOCTOR = FACTORY / "bin" / "doctor"
+
+ANSWERS = "factory/answers.json"
+JOURNAL = "factory/install-log.json"
+BACKUPS = "factory/install-backup"
+SCHEMA = 1
+
+# What is copied from the source commit, as is.
+COMPONENT_TREES = ("factory/bin", ".claude/agents", ".claude/hooks", ".claude/skills")
+COMPONENT_FILES = ("factory/VERSION", "factory/dashboard.html", ".claude/settings.json")
+LICENSE = ("LICENSE", "factory/LICENSE")
+INSTALLABLE_FORGES = ("github",)  # GitLab: specified, not built (ADR 0005)
+# External sources the installed files name, pinned to a commit (spec §8, §11.3).
+CHECKOUT_ACTION = {"name": "actions/checkout", "commit": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+                   "tag": "v7.0.1"}
+SOURCES = {"github": [CHECKOUT_ACTION]}
+GITIGNORE_LINES = ("/factory/jobs/", "/.worktrees/")
+LABEL_COLOURS = {"queue": "0e8a16", "needs_info": "fbca04", "needs_human": "d93f0b"}
+LABEL_TEXT = {"queue": "ticket à traiter par la factory", "needs_info": "la factory attend une réponse",
+              "needs_human": "la factory attend un humain"}
+
+SECRET_PATTERNS = (".env*", "*.pem", "*.key", "*.p8", "*.p12", "*.pfx", "*.jks", "*.keystore",
+                   "*.crt", "*.cer", "*.der", "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*")
+# A new repository (ADR 0004): at most this much history and this many tracked files.
+MAX_NEW_COMMITS = 20
+MAX_NEW_FILES = 50
+COMMAND_KINDS = ("install", "lint", "typecheck", "test", "build")
+COMMENT_EVENTS = re.compile(r"\b(issue_comment|pull_request_review_comment|pull_request_review|discussion_comment)\b")
+GITLAB_CHAT = re.compile(r"CI_PIPELINE_SOURCE\s*==\s*[\"']?chat")
+NPM_PLACEHOLDER = "no test specified"
+
+
+class Stop(Exception):
+    """Something that ends the command: what, and the fix."""
+
+    def __init__(self, what, fix=None, code=1):
+        super().__init__(what)
+        self.what, self.fix, self.code = what, fix, code
+
+
+class Usage(Exception):
+    pass
+
+
+def say(text=""):
+    print(text, flush=True)
+
+
+def sh(*cmd, cwd=None, stdin=None, env=None):
+    try:
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, input=stdin, env=env)
+    except FileNotFoundError:
+        return None
+
+
+def git(cwd, *args):
+    res = sh("git", *args, cwd=cwd)
+    if res is None:
+        raise Stop("git introuvable", "installe git")
+    return res
+
+
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+# ---- paths ------------------------------------------------------------------------
+
+def safe_rel(rel):
+    """A relative path inside a repository, in git's form, or None."""
+    if not isinstance(rel, str) or not rel or "\\" in rel or "\0" in rel or "\n" in rel:
+        return None
+    p = PurePosixPath(rel)
+    if p.is_absolute() or any(part in ("..", ".", "") for part in rel.split("/")):
+        return None
+    if p.parts[0] == ".git":
+        return None
+    return rel
+
+
+def place(target, rel):
+    """The file `rel` of the target, refusing any path that a symlink or `..` takes elsewhere."""
+    if safe_rel(rel) is None:
+        raise Stop(f"chemin refusé : {rel!r}")
+    path = target / rel
+    try:
+        real = path.resolve()
+    except (OSError, RuntimeError):
+        raise Stop(f"{rel} : chemin illisible")
+    if real != target / rel or path.is_symlink():
+        raise Stop(f"{rel} : un lien symbolique mène hors du chemin prévu ({real})",
+                   "retire le lien ou installe dans un dépôt sans lien sur ces chemins")
+    return path
+
+
+# ---- survey (§11.2) ---------------------------------------------------------------
+
+def parse_remote(url):
+    """(forge, instance, owner/name) from a remote URL; forge None when unknown."""
+    if not url:
+        return None, None, None
+    m = (re.match(r"^[\w.+-]+://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(.+?)(?:\.git)?/?$", url)
+         or re.match(r"^(?:[^@/]+@)?([^/:]+):(.+?)(?:\.git)?/?$", url))
+    if not m:
+        return None, None, None
+    host, slug = m.group(1).lower(), m.group(2)
+    if host == "github.com":
+        return "github", "github.com", slug
+    if host == "gitlab.com" or "gitlab" in host.split(".")[0]:
+        return "gitlab", f"https://{host}", slug
+    return None, host, slug
+
+
+def read_text(target, rel, unreadable):
+    try:
+        return (target / rel).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        unreadable.append(f"{rel} illisible ({type(e).__name__})")
+        return None
+
+
+def node_commands(target, files, unreadable):
+    text = read_text(target, "package.json", unreadable)
+    if text is None:
+        return None, {}, []
+    try:
+        pkg = json.loads(text)
+        scripts = pkg.get("scripts") or {} if isinstance(pkg, dict) else None
+        if not isinstance(scripts, dict):
+            raise ValueError("scripts")
+    except ValueError:
+        unreadable.append("package.json illisible (JSON invalide)")
+        return None, {}, []
+    locks = [("pnpm-lock.yaml", "pnpm", "pnpm install --frozen-lockfile", "pnpm run", "pnpm test"),
+             ("yarn.lock", "yarn", "yarn install --frozen-lockfile", "yarn", "yarn test"),
+             ("bun.lock", "bun", "bun install --frozen-lockfile", "bun run", "bun run test"),
+             ("bun.lockb", "bun", "bun install --frozen-lockfile", "bun run", "bun run test"),
+             ("package-lock.json", "npm", "npm ci", "npm run", "npm test")]
+    risks = []
+    for lock, pm, install, run, test in locks:
+        if lock in files:
+            break
+    else:
+        pm, install, run, test = "npm", "npm install", "npm run", "npm test"
+        risks.append("node : pas de fichier de verrouillage des dépendances (installation non reproductible)")
+    cmds = {"install": install}
+    if isinstance(scripts.get("lint"), str):
+        cmds["lint"] = f"{run} lint"
+    for name in ("typecheck", "type-check"):
+        if isinstance(scripts.get(name), str):
+            cmds["typecheck"] = f"{run} {name}"
+            break
+    if isinstance(scripts.get("test"), str) and NPM_PLACEHOLDER not in scripts["test"]:
+        cmds["test"] = test
+    if isinstance(scripts.get("build"), str):
+        cmds["build"] = f"{run} build"
+    return f"node ({pm})", cmds, risks
+
+
+def python_commands(target, files, unreadable):
+    manifest = ""
+    for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt"):
+        if name in files:
+            manifest += read_text(target, name, unreadable) or ""
+    has_tests = any(f.startswith("tests/") or re.search(r"(^|/)test_[^/]*\.py$", f) for f in files)
+    if "uv.lock" in files:
+        pm, install, prefix = "uv", "uv sync --locked", "uv run "
+    elif "poetry.lock" in files:
+        pm, install, prefix = "poetry", "poetry install", "poetry run "
+    elif "requirements.txt" in files:
+        pm, install, prefix = "pip", "python3 -m pip install -r requirements.txt", "python3 -m "
+    else:
+        pm, install, prefix = "pip", None, "python3 -m "
+    cmds = {"install": install} if install else {}
+    risks = [] if pm in ("uv", "poetry") else ["python : pas de fichier de verrouillage des dépendances"]
+    if "ruff" in manifest:
+        cmds["lint"] = f"{prefix}ruff check ."
+    if "mypy" in manifest:
+        cmds["typecheck"] = f"{prefix}mypy ."
+    if "pytest" in manifest:
+        cmds["test"] = f"{prefix}pytest"
+    elif has_tests:
+        cmds["test"] = "python3 -m unittest discover -s tests" if any(f.startswith("tests/") for f in files) \
+            else "python3 -m unittest discover"
+    return f"python ({pm})", cmds, risks
+
+
+def survey(target):
+    """What can be read from the target without asking. Reads no secret file."""
+    facts = {"unreadable": [], "risks": []}
+    url = git(target, "config", "--get", "remote.origin.url").stdout.strip()
+    facts["remote"] = url or None
+    facts["forge"], facts["instance"], facts["slug"] = parse_remote(url)
+
+    count = git(target, "rev-list", "--count", "HEAD")
+    facts["commits"] = int(count.stdout.strip()) if count.returncode == 0 else 0
+    listed = git(target, "ls-files", "-z")
+    files = [f for f in listed.stdout.split("\0") if f]
+    facts["files"] = files
+
+    head = git(target, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if head.returncode == 0 and head.stdout.strip().startswith("origin/"):
+        facts["base"] = head.stdout.strip().removeprefix("origin/")
+    else:
+        facts["base"] = next((b for b in ("main", "master")
+                              if git(target, "rev-parse", "--verify", "-q", f"refs/heads/{b}").returncode == 0),
+                             git(target, "branch", "--show-current").stdout.strip() or "main")
+
+    stacks, commands = [], {}
+    fileset = set(files)
+    detectors = []
+    if "package.json" in fileset:
+        detectors.append(node_commands)
+    if fileset & {"pyproject.toml", "requirements.txt", "setup.py", "uv.lock", "poetry.lock"}:
+        detectors.append(python_commands)
+    for detect in detectors:
+        name, cmds, risks = detect(target, fileset, facts["unreadable"])
+        if name:
+            stacks.append(name)
+            facts["risks"] += risks
+            for k, v in cmds.items():
+                commands.setdefault(k, v)
+    if "Cargo.toml" in fileset:
+        stacks.append("rust (cargo)")
+        for k, v in {"install": "cargo fetch --locked", "lint": "cargo clippy --locked -- -D warnings",
+                     "test": "cargo test --locked", "build": "cargo build --locked"}.items():
+            commands.setdefault(k, v)
+    if "go.mod" in fileset:
+        stacks.append("go")
+        for k, v in {"install": "go mod download", "lint": "go vet ./...", "test": "go test ./...",
+                     "build": "go build ./..."}.items():
+            commands.setdefault(k, v)
+    if "Makefile" in fileset:
+        text = read_text(target, "Makefile", facts["unreadable"]) or ""
+        targets = set(re.findall(r"^([A-Za-z][\w-]*)\s*:(?!=)", text, re.M))
+        if targets & set(COMMAND_KINDS):
+            stacks.append("make")
+        for kind in COMMAND_KINDS:
+            if kind in targets:
+                commands.setdefault(kind, f"make {kind}")
+    facts["stacks"], facts["commands"] = stacks, commands
+
+    ci = []
+    workflows = sorted(f for f in files if re.match(r"^\.github/workflows/[^/]+\.ya?ml$", f))
+    if workflows:
+        ci.append(f"GitHub Actions ({', '.join(PurePosixPath(w).name for w in workflows)})")
+    for name, label in ((".gitlab-ci.yml", "GitLab CI"), ("Jenkinsfile", "Jenkins"),
+                        ("azure-pipelines.yml", "Azure Pipelines"), (".circleci/config.yml", "CircleCI")):
+        if name in fileset:
+            ci.append(label)
+    facts["ci"] = ci
+
+    facts["instructions"] = [f for f in ("AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", "GEMINI.md",
+                                         ".cursorrules", ".github/copilot-instructions.md")
+                             if (target / f).exists()]
+    facts["claude"] = [f for f in (".claude/settings.json", ".claude/settings.local.json", ".mcp.json",
+                                   ".claude/hooks", ".claude/agents", ".claude/skills", ".claude/commands",
+                                   ".vscode/tasks.json") if (target / f).exists() or (target / f).is_symlink()]
+
+    hooks = []
+    path = git(target, "rev-parse", "--git-path", "hooks").stdout.strip()
+    hooks_dir = (target / path) if path else None
+    if hooks_dir and hooks_dir.is_dir():
+        hooks += sorted(p.name for p in hooks_dir.iterdir() if p.is_file() and not p.name.endswith(".sample"))
+    custom = git(target, "config", "--get", "core.hooksPath").stdout.strip()
+    if custom:
+        hooks.append(f"core.hooksPath={custom}")
+    hooks += [f for f in (".husky", ".pre-commit-config.yaml", "lefthook.yml", ".lefthook.yml")
+              if (target / f).exists()]
+    facts["git_hooks"] = hooks
+
+    automations = []
+    for wf in workflows:
+        text = read_text(target, wf, facts["unreadable"])
+        if text is not None and COMMENT_EVENTS.search(text):
+            automations.append(wf)
+    if ".gitlab-ci.yml" in fileset:
+        text = read_text(target, ".gitlab-ci.yml", facts["unreadable"])
+        if text is not None and GITLAB_CHAT.search(text):
+            automations.append(".gitlab-ci.yml (ChatOps)")
+    for f in ("atlantis.yaml", "atlantis.yml"):
+        if f in fileset:
+            automations.append(f)
+    facts["automations"] = automations
+
+    facts["secrets"] = [f for f in files
+                        if any(fnmatch.fnmatchcase(part.lower(), pat)
+                               for part in f.split("/") for pat in SECRET_PATTERNS)]
+    return facts
+
+
+def forge_call(kind, target, *args):
+    env = dict(os.environ, FORGE=kind)
+    res = sh(sys.executable, "-B", str(FORGE), *args, cwd=target, env=env)
+    if res is None or res.returncode != 0:
+        msg = (res.stderr if res else "").strip().removeprefix("forge: ") or "échec sans message"
+        raise Stop(f"forge {' '.join(args)} : {msg}")
+    return json.loads(res.stdout) if res.stdout.strip() else None
+
+
+def forge_facts(facts, answers, target):
+    """Protection, rights and labels, read through factory/bin/forge."""
+    facts["protection"] = facts["rights"] = facts["labels"] = None
+    if answers.get("forge") not in INSTALLABLE_FORGES or not facts["remote"]:
+        return
+    for key, args in (("protection", ("protection", answers["base_branch"])), ("rights", ("permissions",)),
+                      ("labels", ("labels",))):
+        try:
+            facts[key] = forge_call(answers["forge"], target, *args)
+        except (Stop, ValueError) as e:
+            facts["unreadable"].append(f"{args[0]} illisible : {getattr(e, 'what', e)}")
+
+
+def is_new(facts, claimed):
+    files = [f for f in facts["files"] if f not in claimed]
+    return facts["commits"] <= MAX_NEW_COMMITS and len(files) <= MAX_NEW_FILES, len(files)
+
+
+def show_survey(facts, answers, claimed):
+    def items(xs, none):
+        return ", ".join(xs) if xs else none
+
+    new, nfiles = is_new(facts, claimed)
+    forge = facts["forge"] or "inconnue"
+    where = f" ({facts['instance']}, {facts['slug']})" if facts["slug"] else ""
+    say("== découverte")
+    say(f"  forge : {forge}{where} d'après git remote" if facts["remote"] else "  forge : inconnue (pas de remote origin)")
+    say(f"  dépôt : {'neuf' if new else 'existant'} ({facts['commits']} commit(s), {nfiles} fichier(s) suivi(s))")
+    say(f"  pile : {items(facts['stacks'], 'non reconnue')}")
+    cmds = commands_of(facts, answers)
+    say("  commandes : " + (" ; ".join(f"{k} `{cmds[k]}`" for k in COMMAND_KINDS if k in cmds) or "aucune"))
+    say(f"  CI : {items(facts['ci'], 'aucune')}")
+    say(f"  instructions pour agents : {items(facts['instructions'], 'aucune')}")
+    say(f"  réglages Claude : {items(facts['claude'], 'aucun')}")
+    say(f"  hooks git : {items(facts['git_hooks'], 'aucun')}")
+    p = facts.get("protection")
+    if p is None:
+        say("  protection : non relevée")
+    elif p.get("protected"):
+        checks = ", ".join(p.get("required_checks") or []) or "—"
+        say(f"  protection : {p['branch']} protégée ({p.get('required_approvals', 0)} approbation(s), "
+            f"contrôles requis : {checks})")
+    else:
+        say(f"  protection : {p['branch']} non protégée")
+    r = facts.get("rights")
+    if r is None:
+        say("  droits : non relevés")
+    else:
+        words = {"push": "pousser", "label": "étiqueter", "merge": "fusionner"}
+        have = [w for k, w in words.items() if r.get(k) is True]
+        say(f"  droits : {', '.join(have) or 'aucun'}")
+    say(f"  automatisations par commentaire : {items(facts['automations'], 'aucune')}")
+    say(f"  secrets suivis : {items(facts['secrets'], 'aucun')}")
+
+
+# ---- questions (§11.2) ------------------------------------------------------------
+
+def plans_of(forge):
+    return ("free", "premium", "ultimate") if forge == "gitlab" else ("free", "pro", "team", "enterprise")
+
+
+def check_answer(key, value, answers):
+    """The answer, normalised, or raise ValueError with what was expected."""
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        raise ValueError("une chaîne ou un nombre")
+    text = str(value).strip()
+    if "\n" in str(value) or "\r" in str(value) or not text:
+        raise ValueError("une seule ligne non vide")
+    if key == "forge":
+        if text not in ("github", "gitlab"):
+            raise ValueError("github|gitlab")
+        return text
+    if key == "forge_instance":
+        if text == "gitlab.com":
+            text = "https://gitlab.com"
+        if not re.fullmatch(r"https://[A-Za-z0-9.-]+(?::\d+)?", text):
+            raise ValueError("https://gitlab.com ou https://<hôte>")
+        return text
+    if key == "forge_plan":
+        allowed = plans_of(answers.get("forge"))
+        if text not in allowed:
+            raise ValueError("|".join(allowed))
+        return text
+    if key == "tier":
+        if text not in ("1", "2", "3"):
+            raise ValueError("1|2|3")
+        return int(text)
+    if key in ("retry_budget", "max_waiting_for_human"):
+        if not re.fullmatch(r"[1-9]\d*", text):
+            raise ValueError("un nombre entier ≥ 1")
+        return int(text)
+    if key == "max_cost_usd":
+        if not re.fullmatch(r"\d+(\.\d+)?", text) or float(text) <= 0:
+            raise ValueError("un nombre > 0")
+        return int(text) if text.isdigit() else float(text)
+    if key == "base_branch":
+        res = sh("git", "check-ref-format", "--branch", text)
+        if res is None or res.returncode != 0 or text.startswith("-"):
+            raise ValueError("un nom de branche git")
+        return text
+    if key == "deploy_target":
+        return text
+    if key.startswith("command."):
+        if key.removeprefix("command.") not in COMMAND_KINDS:
+            raise ValueError(f"command.<{'|'.join(COMMAND_KINDS)}>")
+        return text
+    raise ValueError("une clé connue")
+
+
+KNOWN_KEYS = ("forge", "forge_instance", "forge_plan", "tier", "deploy_target", "retry_budget",
+              "max_cost_usd", "max_waiting_for_human", "base_branch")
+
+
+def questions(facts, answers):
+    """(key, question, choices shown, default) in §11.2's order, for what isn't answered."""
+    forge = answers.get("forge")
+    qs = [("forge", "Forge", "github|gitlab", facts["forge"])]
+    if forge == "gitlab":
+        default = facts["instance"] if facts["forge"] == "gitlab" else "https://gitlab.com"
+        qs.append(("forge_instance", "Instance GitLab", None, default))
+    if forge:
+        qs.append(("forge_plan", "Offre de la forge", "|".join(plans_of(forge)), "free"))
+    qs += [("tier", "Palier visé", "1|2|3", "1"),
+           ("deploy_target", "Cible de déploiement", None, "aucune"),
+           ("retry_budget", "Budget de reprise par job", None, "3"),
+           ("max_cost_usd", "Plafond de coût par job (USD)", None, "25"),
+           ("max_waiting_for_human", "Demandes de fusion en attente d'un humain, au plus", None, "3"),
+           ("base_branch", "Branche de base", None, facts["base"])]
+    return qs
+
+
+def read_line():
+    line = sys.stdin.readline()
+    return None if line == "" else line.rstrip("\n")
+
+
+def ask(facts, answers):
+    """Ask each unanswered question on stdin; an answer can add a question (GitLab's
+    instance, the forge's plans). EOF before an answer stops everything."""
+    header = False
+    while True:
+        pending = [q for q in questions(facts, answers) if q[0] not in answers]
+        if not pending:
+            return
+        if not header:
+            say("== questions")
+            header = True
+        key, text, choices, default = pending[0]
+        shown = f" ({choices})" if choices else ""
+        print(f"? {text}{shown}" + (f" [{default}]" if default else "") + " : ", end="", flush=True)
+        line = read_line()
+        if line is None:
+            say()
+            raise Stop(f"réponse manquante : {text}", f"réponds sur l'entrée standard, ou passe --answer {key}=…")
+        value = line.strip() or default
+        if not value:
+            continue
+        try:
+            answers[key] = check_answer(key, value, answers)
+        except ValueError as e:
+            say(f"  réponse incomprise : « {value} » (attendu : {e})")
+
+
+def load_answers(target):
+    path = target / ANSWERS
+    if not path.exists() and not path.is_symlink():
+        return None
+    place(target, ANSWERS)
+    bad = lambda why: Stop(f"{ANSWERS} incompris : {why}", f"corrige {ANSWERS} ou retire-le pour reposer les questions")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        raise bad(f"JSON illisible ({e})")
+    if not isinstance(data, dict) or set(data) != {"schema", "answers"} or data["schema"] != SCHEMA \
+            or not isinstance(data["answers"], dict):
+        raise bad(f"attendu {{\"schema\": {SCHEMA}, \"answers\": {{…}}}}")
+    answers = {}
+    raw = data["answers"]
+    for key in [k for k in KNOWN_KEYS if k in raw] + sorted(k for k in raw if k not in KNOWN_KEYS):
+        try:
+            answers[key] = check_answer(key, raw[key], answers)
+        except ValueError as e:
+            raise bad(f"{key} = {raw[key]!r} (attendu : {e})")
+    missing = [q[0] for q in questions({"forge": None, "instance": None, "base": None}, answers)
+               if q[0] not in answers]
+    if missing:
+        raise bad(f"réponses manquantes : {', '.join(missing)}")
+    return answers
+
+
+def answers_text(answers):
+    return json.dumps({"schema": SCHEMA, "answers": answers}, indent=2, ensure_ascii=False) + "\n"
+
+
+def commands_of(facts, answers):
+    cmds = dict(facts["commands"])
+    for kind in COMMAND_KINDS:
+        value = answers.get(f"command.{kind}")
+        if value is not None:
+            if value == "aucune":
+                cmds.pop(kind, None)
+            else:
+                cmds[kind] = value
+    return cmds
+
+
+# ---- readiness --------------------------------------------------------------------
+
+def readiness(facts, answers, claimed):
+    ready, risky, blocking = [], list(facts["risks"]), []
+    blocking += supported(answers)
+    if not facts["remote"]:
+        blocking.append("pas de dépôt distant origin : la forge ne peut pas être déduite ni jointe")
+    new, nfiles = is_new(facts, claimed)
+    if not new:
+        blocking.append(f"dépôt existant ({facts['commits']} commits, {nfiles} fichiers) : le palier 1 "
+                        f"n'installe que sur un dépôt neuf (ADR 0004, spec §11.6)")
+    if facts["secrets"]:
+        blocking.append(f"secrets suivis par git : {', '.join(facts['secrets'])} — retire-les de l'historique "
+                        "et change-les avant d'installer")
+    if facts["automations"]:
+        blocking.append(f"automatisations par commentaire : {', '.join(facts['automations'])} — un agent qui "
+                        "commente aurait leur pouvoir (spec §8) ; retire-les ou installe ailleurs")
+    blocking += facts["unreadable"]
+    cmds = commands_of(facts, answers)
+    if "test" not in cmds:
+        blocking.append("aucune commande de test relevée : checks.sh ne prouverait rien — ajoute un script de "
+                        "test, ou réponds --answer command.test=…")
+    else:
+        ready.append(f"checks.sh : {', '.join(k for k in COMMAND_KINDS if k in cmds)}")
+    r = facts.get("rights")
+    if r is not None:
+        lacking = [w for k, w in (("push", "pousser"), ("label", "étiqueter"), ("merge", "fusionner"))
+                   if r.get(k) is not True]
+        if lacking:
+            blocking.append(f"le compte ne peut pas {', '.join(lacking)} sur ce dépôt")
+    p = facts.get("protection")
+    if p is not None and not p.get("protected"):
+        risky.append(f"{p['branch']} non protégée sur la forge : un push direct contourne le gate "
+                     "(protection exigée côté forge : palier 3, ADR 0005)")
+    if answers.get("deploy_target", "aucune") != "aucune":
+        risky.append(f"cible de déploiement « {answers['deploy_target']} » notée ; les composants de la "
+                     "section 12 ne sont pas encore construits")
+    def foreign(entry):  # a Claude setting not posed by the factory
+        inside = [f for f in facts["files"] if f == entry or f.startswith(entry + "/")]
+        return entry not in claimed and (not inside or any(f not in claimed for f in inside))
+    others = [c for c in facts["claude"] if foreign(c)]
+    if others:
+        risky.append(f"réglages Claude existants ({', '.join(others)}) : ils s'exécutent dans les "
+                     "sessions des agents, relis-les")
+    if facts["git_hooks"]:
+        risky.append(f"hooks git ({', '.join(facts['git_hooks'])}) : ils s'exécutent aux commits des agents")
+    if not facts["instructions"]:
+        risky.append("aucune instruction pour agents (AGENTS.md) : les agents n'auront que le code")
+    if answers.get("forge") in INSTALLABLE_FORGES:
+        ready.append(f"forge {answers['forge']} : adaptateur disponible")
+    return ready, risky, blocking
+
+
+def supported(answers):
+    out = []
+    if answers.get("forge") == "gitlab":
+        out.append("forge GitLab : l'adaptateur est spécifié mais pas encore construit (ADR 0005) ; "
+                   "rien n'est installé")
+    if answers.get("tier", 1) != 1:
+        out.append(f"palier {answers['tier']} : pas encore installable (palier 1 seulement, ADR 0001)")
+    return out
+
+
+def show_readiness(ready, risky, blocking):
+    say("== aptitude")
+    for word, xs in (("prêt", ready), ("risqué", risky), ("bloque", blocking)):
+        for x in xs:
+            say(f"  {word:<7}: {x}")
+
+
+# ---- plan -------------------------------------------------------------------------
+
+class Item:
+    def __init__(self, path, data, executable=False, kind="file"):
+        self.path, self.data, self.executable, self.kind = path, data, executable, kind
+        self.state = None    # create | same | conflict
+        self.consent = False
+
+
+def source_commit():
+    """This checkout's HEAD, refusing what it installs if it has uncommitted changes."""
+    res = sh("git", "rev-parse", "--verify", "-q", "HEAD^{commit}", cwd=SOURCE)
+    if res is None or res.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", res.stdout.strip()):
+        raise Stop(f"source de la factory non épinglée : {SOURCE} n'est pas un dépôt git avec un commit",
+                   "installe depuis un clone git de la factory")
+    paths = [*COMPONENT_TREES, *COMPONENT_FILES, LICENSE[0], "factory/config.json"]
+    dirty = sh("git", "status", "--porcelain", "--untracked-files=all", "--", *paths, cwd=SOURCE)
+    if dirty.returncode != 0 or dirty.stdout.strip():
+        shown = "; ".join(l.strip() for l in dirty.stdout.splitlines()[:5])
+        raise Stop(f"source de la factory non épinglée : changements non validés ({shown})",
+                   "valide ou annule ces changements dans la factory : on installe un commit, pas un brouillon")
+    return res.stdout.strip()
+
+
+def from_source(commit, rel):
+    res = subprocess.run(["git", "show", f"{commit}:{rel}"], cwd=SOURCE, capture_output=True)
+    if res.returncode != 0:
+        raise Stop(f"{rel} absent du commit {commit[:12]} de la factory")
+    return res.stdout
+
+
+def component_items(commit):
+    listed = sh("git", "ls-tree", "-r", "-z", commit, "--", *COMPONENT_TREES, *COMPONENT_FILES, cwd=SOURCE)
+    items = []
+    for entry in listed.stdout.split("\0"):
+        if not entry:
+            continue
+        meta, rel = entry.split("\t", 1)
+        mode, kind, _ = meta.split()
+        if kind != "blob" or mode == "120000":
+            raise Stop(f"{rel} : seul un fichier ordinaire s'installe (mode {mode})")
+        items.append(Item(rel, from_source(commit, rel), executable=mode == "100755"))
+    items.append(Item(LICENSE[1], from_source(commit, LICENSE[0])))
+    return items
+
+
+def config_text(commit, answers):
+    config = json.loads(from_source(commit, "factory/config.json"))
+    config.update(forge=answers["forge"], base_branch=answers["base_branch"],
+                  retry_budget=answers["retry_budget"], max_cost_usd=answers["max_cost_usd"],
+                  max_waiting_for_human=answers["max_waiting_for_human"])
+    extra = [ANSWERS, JOURNAL, f"{BACKUPS}/*"] + ([".github/workflows/*"] if answers["forge"] == "github" else [])
+    config["protected_paths"] = list(config.get("protected_paths", [])) + \
+        [p for p in extra if p not in config.get("protected_paths", [])]
+    return json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+
+
+def quote_sh(text):
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def checks_text(cmds):
+    lines = ["#!/usr/bin/env bash",
+             "# The repo's checks. Exit 0 only when the branch is fit to review.",
+             "#",
+             "# Écrit par factory install d'après la découverte du dépôt (spec §11.2, §7.1).",
+             "# Pour changer une commande : --answer command.<étape>=… ou factory/answers.json,",
+             "# puis factory install (ce fichier est un chemin protégé : la modification passe",
+             "# par un humain). Rapide, déterministe, non interactif : le gate l'exécute.",
+             "set -euo pipefail", ""]
+    for kind in COMMAND_KINDS:
+        if kind in cmds:
+            lines += [f"echo {quote_sh(f'== {kind} : {cmds[kind]}')} >&2", cmds[kind], ""]
+    lines.append("echo '== checks : OK' >&2")
+    return "\n".join(lines) + "\n"
+
+
+def workflow_text(answers):
+    a = CHECKOUT_ACTION
+    return (f"# Posé par factory install : rejoue factory/checks.sh sur chaque demande de fusion.\n"
+            f"# Actions épinglées à un commit (spec §8). Non bloquant au palier 1 (gate local).\n"
+            f"name: factory-checks\n"
+            f"on:\n"
+            f"  pull_request:\n"
+            f"  push:\n"
+            f"    branches: [{json.dumps(answers['base_branch'])}]\n"
+            f"permissions:\n"
+            f"  contents: read\n"
+            f"jobs:\n"
+            f"  checks:\n"
+            f"    runs-on: ubuntu-24.04\n"
+            f"    timeout-minutes: 30\n"
+            f"    steps:\n"
+            f"      - uses: {a['name']}@{a['commit']} # {a['tag']}\n"
+            f"        with:\n"
+            f"          persist-credentials: false\n"
+            f"      - run: bash factory/checks.sh\n")
+
+
+def gitignore_item(target):
+    path = place(target, ".gitignore")
+    try:
+        old = path.read_text(encoding="utf-8") if path.exists() else ""
+    except (OSError, UnicodeDecodeError) as e:
+        raise Stop(f".gitignore illisible ({type(e).__name__})", "réécris-le en UTF-8")
+    present = {l.strip() for l in old.splitlines()}
+    missing = [l for l in GITIGNORE_LINES if l not in present]
+    if not missing:
+        return Item(".gitignore", old.encode())
+    sep = "" if not old or old.endswith("\n") else "\n"
+    header = "# factory (runtime state, never committed)\n"
+    return Item(".gitignore", (old + sep + header + "\n".join(missing) + "\n").encode())
+
+
+def build_plan(target, commit, answers, facts, journal, answers_from_file):
+    items = component_items(commit)
+    items += [Item("factory/config.json", config_text(commit, answers).encode()),
+              Item("factory/checks.sh", checks_text(commands_of(facts, answers)).encode(), executable=True),
+              gitignore_item(target)]
+    if answers["forge"] == "github":
+        items.append(Item(".github/workflows/factory-checks.yml", workflow_text(answers).encode()))
+    if not answers_from_file:
+        items.append(Item(ANSWERS, answers_text(answers).encode()))
+    for it in items:
+        path = place(target, it.path)
+        for parent in PurePosixPath(it.path).parents:
+            if str(parent) != ".":
+                place(target, str(parent))
+        if path.exists() and not path.is_file():
+            raise Stop(f"{it.path} existe et n'est pas un fichier")
+        if not path.exists():
+            it.state = "create"
+        elif path.read_bytes() == it.data and bool(path.stat().st_mode & 0o100) == it.executable:
+            it.state = "same"
+        else:
+            it.state = "conflict"
+    config = json.loads(from_source(commit, "factory/config.json"))
+    present = {l["name"] for l in facts.get("labels") or []}
+    labels = []
+    for key, name in (config.get("labels") or {}).items():
+        labels.append({"name": name, "colour": LABEL_COLOURS.get(key, "ededed"),
+                       "description": LABEL_TEXT.get(key, ""), "exists": name in present})
+    return items, labels
+
+
+def ask_consent(items, overwrite, interactive):
+    for it in items:
+        if it.state != "conflict":
+            continue
+        if it.path in overwrite:
+            it.consent = True
+        elif interactive:
+            print(f"? {it.path} existe et diffère de ce que la factory poserait — écraser ? [o/N] : ",
+                  end="", flush=True)
+            line = read_line()
+            if line is None:
+                say()
+            it.consent = (line or "").strip().lower() in ("o", "oui")
+
+
+def show_plan(items, labels, journal_changed, dry_run, first):
+    say("== plan")
+    shown = 0
+    for it in items:
+        if it.state == "create":
+            say(f"  {'créer':<10} {it.path}")
+        elif it.state == "conflict" and dry_run:
+            say(f"  {'remplacer?':<10} {it.path} (accord requis)")
+        elif it.state == "conflict" and it.consent:
+            say(f"  {'remplacer':<10} {it.path} (accord donné)")
+        elif it.state == "conflict":
+            say(f"  {'garder':<10} {it.path} (existe et diffère ; accord refusé : non posé)")
+        else:
+            continue
+        shown += 1
+    for l in labels:
+        if not l["exists"]:
+            say(f"  {'label':<10} créer {l['name']}")
+            shown += 1
+    if journal_changed:
+        say(f"  {'créer' if first else 'écrire':<10} {JOURNAL}")
+        shown += 1
+    same = sum(1 for it in items if it.state == "same")
+    if not shown:
+        say("  aucun écart")
+    say(f"  ({same} fichier(s) déjà à jour)")
+
+
+# ---- journal ----------------------------------------------------------------------
+
+def load_journal(target, strict=True):
+    path = target / JOURNAL
+    if not path.exists() and not path.is_symlink():
+        if strict:
+            raise Stop(f"pas de journal {JOURNAL} : rien à désinstaller d'après lui",
+                       "la désinstallation ne retire que ce que le journal liste")
+        return None
+    place(target, JOURNAL)
+    bad = lambda why: Stop(f"{JOURNAL} incompris : {why} ; rien n'est retiré",
+                           f"restaure {JOURNAL} depuis git (`git log -- {JOURNAL}`)")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        raise bad(f"JSON illisible ({e})")
+    keys = {"schema", "factory_version", "source_commit", "forge", "sources", "files", "labels"}
+    if not isinstance(data, dict) or set(data) != keys or data["schema"] != SCHEMA:
+        raise bad("champs inattendus")
+    if data["forge"] not in ("github", "gitlab") or not isinstance(data["files"], list) \
+            or not isinstance(data["labels"], list) or not isinstance(data["sources"], list):
+        raise bad("forge, files, labels ou sources")
+    seen = set()
+    for f in data["files"]:
+        if not isinstance(f, dict) or safe_rel(f.get("path")) is None or f["path"] in seen:
+            raise bad(f"entrée de fichier {f!r}")
+        seen.add(f["path"])
+        if not isinstance(f.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", f["sha256"]):
+            raise bad(f"empreinte de {f['path']}")
+        if f.get("action") == "replaced":
+            if set(f) != {"path", "sha256", "action", "backup"} or f["backup"] != f"{BACKUPS}/{f['path']}":
+                raise bad(f"sauvegarde de {f['path']}")
+        elif f.get("action") in ("created", "adopted"):
+            if set(f) != {"path", "sha256", "action"}:
+                raise bad(f"entrée de {f['path']}")
+        else:
+            raise bad(f"action {f.get('action')!r} de {f['path']}")
+    for l in data["labels"]:
+        if not isinstance(l, dict) or set(l) != {"name", "created"} or not isinstance(l["name"], str) \
+                or not isinstance(l["created"], bool):
+            raise bad(f"label {l!r}")
+    return data
+
+
+def journal_text(journal):
+    return json.dumps(journal, indent=2, ensure_ascii=False) + "\n"
+
+
+# ---- commands ---------------------------------------------------------------------
+
+def parse_answers(pairs):
+    answers = {}
+    for pair in pairs:
+        key, eq, value = pair.partition("=")
+        if not eq:
+            raise Usage(f"--answer {pair!r} : attendu CLÉ=VALEUR")
+        if key not in KNOWN_KEYS and not key.startswith("command."):
+            raise Usage(f"--answer : clé inconnue « {key} » (clés : {', '.join(KNOWN_KEYS)}, command.<étape>)")
+        if key in answers:
+            raise Usage(f"--answer {key} donné deux fois")
+        answers[key] = value
+    out = {}
+    for key in [k for k in KNOWN_KEYS if k in answers] + sorted(k for k in answers if k not in KNOWN_KEYS):
+        try:
+            out[key] = check_answer(key, answers[key], out)
+        except ValueError as e:
+            raise Usage(f"--answer {key}={answers[key]!r} : incompris (attendu : {e})")
+    return out
+
+
+def target_of(args):
+    raw = Path(args.target or ".").resolve()
+    top = sh("git", "rev-parse", "--show-toplevel", cwd=raw) if raw.is_dir() else None
+    if top is None or top.returncode != 0:
+        raise Stop(f"{raw} n'est pas un dépôt git", "crée le dépôt (`git init`) et son distant d'abord")
+    return Path(top.stdout.strip()).resolve()
+
+
+def gather(target, args, interactive=True):
+    """Survey, answers (file, flags or questions), forge facts. Returns (facts, answers, from_file, journal)."""
+    journal = load_journal(target, strict=False)
+    claimed = {f["path"] for f in journal["files"]} if journal else set()
+    claimed |= {ANSWERS, JOURNAL}
+    facts = survey(target)
+    stored = load_answers(target)
+    given = parse_answers(args.answer)
+    if stored is not None and given:
+        raise Stop(f"les réponses viennent de {ANSWERS} : --answer ne les remplace pas",
+                   f"modifie {ANSWERS} (versionné) puis relance")
+    answers = stored if stored is not None else given
+    if stored is not None:
+        say(f"== questions\n  réponses : {ANSWERS} (aucune question)")
+    else:
+        ask(facts, answers)
+    forge_facts(facts, answers, target)
+    return facts, answers, stored is not None, journal, claimed
+
+
+def cmd_discover(args):
+    target = target_of(args)
+    facts, answers, from_file, journal, claimed = gather(target, args)
+    show_survey(facts, answers, claimed)
+    ready, risky, blocking = readiness(facts, answers, claimed)
+    show_readiness(ready, risky, blocking)
+    if not from_file and not args.dry_run:
+        place(target, ANSWERS).parent.mkdir(parents=True, exist_ok=True)
+        place(target, ANSWERS).write_text(answers_text(answers), encoding="utf-8")
+        say(f"== réponses écrites dans {ANSWERS} (à valider avec le reste)")
+    if blocking:
+        say("DISCOVER: FAIL (voir « bloque »)")
+        return 1
+    say("DISCOVER: OK" + (" (à blanc, rien d'écrit)" if args.dry_run else ""))
+    return 0
+
+
+def run_doctor(target, forge, base):
+    say("== doctor")
+    env = dict(os.environ, FORGE=forge or "github")
+    res = subprocess.run([sys.executable, "-B", str(DOCTOR), "--base", base], cwd=target, env=env,
+                         stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    for line in (res.stdout + res.stderr).splitlines():
+        say(f"  {line}")
+    if res.returncode != 0:
+        raise Stop("doctor : un prérequis manque (voir ci-dessus)", "corrige-le, puis relance factory install")
+
+
+def cmd_install(args):
+    target = target_of(args)
+    if target == SOURCE.resolve():
+        raise Stop("la factory ne s'installe pas sur elle-même", "lance factory install depuis le dépôt cible "
+                   "ou avec --target, à partir d'un clone de la factory")
+    for rel in args.overwrite:
+        if safe_rel(rel) is None:
+            raise Usage(f"--overwrite {rel!r} : chemin relatif du dépôt attendu")
+    commit = source_commit()
+    stored = load_answers(target)
+    early = stored if stored is not None else parse_answers(args.answer)
+    stops = supported(early)
+    if stops:
+        show_readiness([], [], stops)
+        raise Stop("réponses non installables (voir « bloque »)")
+    facts0 = survey(target)
+    run_doctor(target, early.get("forge") or facts0["forge"], early.get("base_branch") or facts0["base"])
+
+    facts, answers, from_file, journal, claimed = gather(target, args)
+    show_survey(facts, answers, claimed)
+    ready, risky, blocking = readiness(facts, answers, claimed)
+    show_readiness(ready, risky, blocking)
+    if blocking:
+        raise Stop("installation impossible (voir « bloque ») ; rien n'est écrit")
+
+    items, labels = build_plan(target, commit, answers, facts, journal, from_file)
+    unknown = [p for p in args.overwrite if p not in {it.path for it in items if it.state == "conflict"}]
+    if unknown:
+        raise Usage(f"--overwrite {', '.join(unknown)} : aucun fichier existant à remplacer à ce chemin")
+    if not args.dry_run:
+        ask_consent(items, set(args.overwrite), interactive=True)
+
+    new_journal = next_journal(target, commit, answers, items, labels, journal, from_file)
+    old_text = (target / JOURNAL).read_text() if journal else None
+    changed = journal_text(new_journal) != old_text
+    show_plan(items, labels, changed, args.dry_run, first=journal is None)
+    if args.dry_run:
+        say("INSTALL: OK (à blanc, rien d'écrit)")
+        return 0
+
+    apply(target, items, labels, answers, journal)
+    if changed:
+        place(target, JOURNAL).write_text(journal_text(new_journal), encoding="utf-8")
+    say(f"== version installée : factory {new_journal['factory_version']}, commit {commit}")
+    declined = [it.path for it in items if it.state == "conflict" and not it.consent]
+    say("== audit")
+    audit = subprocess.run([sys.executable, "-B", str(target / "factory/bin/audit"), "--root", str(target)],
+                           capture_output=True, text=True)
+    for line in (audit.stdout + audit.stderr).splitlines():
+        say(f"  {line}")
+    if audit.returncode != 0 and not declined:
+        raise Stop("audit du dépôt installé en échec (voir ci-dessus)")
+    if declined:
+        say(f"INSTALL: INCOMPLET — non posés sans accord : {', '.join(declined)}")
+        say(f"      Correction : relance avec --overwrite <chemin> pour chacun, ou réponds `o`")
+        return 1
+    say("INSTALL: OK")
+    return 0
+
+
+def next_journal(target, commit, answers, items, labels, journal, from_file):
+    old = {f["path"]: f for f in journal["files"]} if journal else {}
+    files = dict(old)
+    for it in items:
+        sha = sha256_bytes(it.data)
+        prev = old.get(it.path)
+        if it.state == "create" or (it.state == "conflict" and it.consent):
+            if prev and prev["action"] in ("created", "replaced"):
+                files[it.path] = dict(prev, sha256=sha)
+            elif it.state == "create":
+                files[it.path] = {"path": it.path, "sha256": sha, "action": "created"}
+            else:
+                files[it.path] = {"path": it.path, "sha256": sha, "action": "replaced",
+                                  "backup": f"{BACKUPS}/{it.path}"}
+    if from_file:
+        sha = sha256_bytes((target / ANSWERS).read_bytes())
+        prev = old.get(ANSWERS)
+        files[ANSWERS] = dict(prev, sha256=sha) if prev else {"path": ANSWERS, "sha256": sha, "action": "adopted"}
+    created = {l["name"] for l in journal["labels"] if l["created"]} if journal else set()
+    out_labels = [{"name": l["name"], "created": (not l["exists"]) or l["name"] in created} for l in labels]
+    version = from_source(commit, "factory/VERSION").decode().strip()
+    return {"schema": SCHEMA, "factory_version": version, "source_commit": commit, "forge": answers["forge"],
+            "sources": SOURCES.get(answers["forge"], []),
+            "files": [files[p] for p in sorted(files)], "labels": out_labels}
+
+
+def apply(target, items, labels, answers, journal):
+    old = {f["path"]: f for f in journal["files"]} if journal else {}
+    for it in items:
+        if not (it.state == "create" or (it.state == "conflict" and it.consent)):
+            continue
+        path = place(target, it.path)
+        if it.state == "conflict" and it.path not in old:
+            backup = place(target, f"{BACKUPS}/{it.path}")
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            backup.write_bytes(path.read_bytes())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(it.data)
+        path.chmod(0o755 if it.executable else 0o644)
+    for l in labels:
+        if not l["exists"]:
+            forge_call(answers["forge"], target, "label", "create", l["name"], "--color", l["colour"],
+                       "--description", l["description"])
+
+
+def cmd_uninstall(args):
+    target = target_of(args)
+    journal = load_journal(target)
+    # Check every path before touching anything.
+    for f in journal["files"]:
+        place(target, f["path"])
+        if f["action"] == "replaced":
+            place(target, f["backup"])
+    present = None
+    if any(l["created"] for l in journal["labels"]):
+        present = {l["name"] for l in forge_call(journal["forge"], target, "labels") or []}
+
+    say("== désinstallation d'après " + JOURNAL)
+    kept, todo = [], []
+    for f in journal["files"]:
+        path = target / f["path"]
+        if not path.exists():
+            say(f"  {'absent':<11} {f['path']}")
+            continue
+        if sha256_bytes(path.read_bytes()) != f["sha256"]:
+            say(f"  {'garder':<11} {f['path']} (modifié depuis l'installation)")
+            kept.append(f)
+            continue
+        if f["action"] == "replaced":
+            if not (target / f["backup"]).is_file():
+                say(f"  {'garder':<11} {f['path']} (sauvegarde {f['backup']} absente)")
+                kept.append(f)
+                continue
+            say(f"  {'restaurer':<11} {f['path']}")
+        else:
+            say(f"  {'retirer':<11} {f['path']}")
+        todo.append(f)
+    labels = [l for l in journal["labels"] if l["created"] and l["name"] in (present or set())]
+    for l in labels:
+        say(f"  {'label':<11} retirer {l['name']}")
+    if args.dry_run:
+        say("UNINSTALL: OK (à blanc, rien de retiré)")
+        return 0
+
+    for l in labels:  # first: the forge script is among the files removed
+        forge_call(journal["forge"], target, "label", "delete", l["name"])
+    touched = set()
+    for f in todo:
+        path = target / f["path"]
+        if f["action"] == "replaced":
+            backup = target / f["backup"]
+            path.write_bytes(backup.read_bytes())
+            backup.unlink()
+            touched.add(backup.parent)
+        else:
+            path.unlink()
+            touched.add(path.parent)
+    if kept:
+        rest = dict(journal, files=kept, labels=[])
+        (target / JOURNAL).write_text(journal_text(rest), encoding="utf-8")
+    else:
+        (target / JOURNAL).unlink()
+        touched.add((target / JOURNAL).parent)
+    for d in sorted(touched, key=lambda p: -len(p.parts)):
+        while d != target and d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+            d = d.parent
+    if kept:
+        say(f"UNINSTALL: INCOMPLET — gardés car modifiés : {', '.join(f['path'] for f in kept)}")
+        say(f"      Correction : revois-les, supprime-les à la main, puis retire {JOURNAL}")
+        return 1
+    say("UNINSTALL: OK")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="factory", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name in ("discover", "install", "uninstall"):
+        s = sub.add_parser(name)
+        s.add_argument("--target", help="the repository to install into (default: current directory)")
+        s.add_argument("--dry-run", action="store_true", help="show, write nothing")
+        if name != "uninstall":
+            s.add_argument("--answer", action="append", default=[], metavar="KEY=VALUE")
+        if name == "install":
+            s.add_argument("--overwrite", action="append", default=[], metavar="PATH",
+                           help="consent to replace this existing file (once per file)")
+    args = p.parse_args()
+    try:
+        if args.cmd != "uninstall":
+            parse_answers(args.answer)  # usage errors before anything else
+        code = {"discover": cmd_discover, "install": cmd_install, "uninstall": cmd_uninstall}[args.cmd](args)
+    except Usage as e:
+        print(f"factory {args.cmd}: {e}", file=sys.stderr)
+        sys.exit(2)
+    except Stop as e:
+        say(f"FAIL  {e.what}" + (f"\n      Correction : {e.fix}" if e.fix else ""))
+        say(f"{args.cmd.upper()}: FAIL")
+        sys.exit(e.code)
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()

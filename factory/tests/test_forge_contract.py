@@ -59,7 +59,7 @@ class FakeWorld:
         self.bindir = bindir
         self.save({"user": self.user, "next": 0, "issues": {}, "comments": {}, "deps": {},
                    "pulls": {}, "check_runs": {}, "statuses": {}, "reviews": {},
-                   "protection": {}, "rules": {}})
+                   "protection": {}, "rules": {}, "labels": []})
 
     def env(self):
         env = dict(os.environ)
@@ -174,6 +174,12 @@ class FakeWorld:
     def protect(self, branch, protection):
         self.edit(lambda s: s["protection"].update({branch: protection}))
 
+    def repo_labels(self):
+        return {l["name"] for l in self.load()["labels"]}
+
+    def forget_label(self, name):
+        pass
+
 
 class LiveWorld:
     """A real GitHub repository, through the real gh."""
@@ -282,6 +288,14 @@ class LiveWorld:
 
     def protect(self, *a, **k):
         self.skip("branch protection is left alone")
+
+    def repo_labels(self):
+        return {l["name"] for l in self.api(self.r("labels?per_page=100")) or []}
+
+    def forget_label(self, name):
+        from urllib.parse import quote
+        self.case.addCleanup(subprocess.run, ["gh", "api", "-X", "DELETE",
+                                              self.r(f"labels/{quote(name, safe='')}")], capture_output=True)
 
 
 class ForgeContract(unittest.TestCase):
@@ -650,6 +664,35 @@ class ForgeContract(unittest.TestCase):
     def test_unreadable_rulesets_fail_closed(self):
         self.world.rules_unreadable()
         self.forge_fails("protection", "main")
+
+    # ---- repository labels (factory install) --------------------------------
+
+    def test_label_create_list_delete(self):
+        name = f"{self.label}:needs-info"
+        self.world.forget_label(name)
+        self.assertNotIn(name, {l["name"] for l in self.forge_json("labels")})
+        self.forge_ok("label", "create", name, "--color", "d73a4a", "--description", "posé par la factory")
+        listed = {l["name"]: l for l in self.forge_json("labels")}
+        self.assertIn(name, listed)
+        self.assertEqual(listed[name]["color"], "d73a4a")
+        self.assertIn(name, self.world.repo_labels())
+        self.forge_ok("label", "delete", name)
+        self.assertNotIn(name, self.world.repo_labels())
+
+    def test_label_create_refuses_an_existing_label(self):
+        self.world.forget_label(self.label)
+        self.forge_ok("label", "create", self.label)
+        res = self.forge_fails("label", "create", self.label)
+        self.assertIn("existe déjà", res.stderr)
+        self.assertEqual([l for l in self.world.repo_labels() if l == self.label], [self.label])
+
+    def test_label_delete_of_a_missing_label_fails(self):
+        self.forge_fails("label", "delete", self.label)
+
+    def test_label_create_rejects_a_bad_colour(self):
+        res = self.forge("label", "create", self.label, "--color", "#red")
+        self.assertEqual(res.returncode, 2)
+        self.assertNotIn(self.label, self.world.repo_labels())
 
     # ---- adapters -----------------------------------------------------------
 

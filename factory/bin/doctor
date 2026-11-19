@@ -14,6 +14,9 @@ Checks, in order (the costly one last):
   6. dated prices (config `prices_as_of`); older than 90 days is flagged, not blocking
   7. every model named in the config's routing answers a one-line prompt
 
+`--base BRANCH` replaces the config's `base_branch` (factory install runs this
+doctor on the target repository, whose base comes from its answers).
+
 Exit status: 0 ready (warnings allowed), 1 something to fix, 2 usage error.
 """
 
@@ -249,7 +252,9 @@ def check_models(models):
 
 
 def main():
-    argparse.ArgumentParser(prog="doctor", description=__doc__.split("\n")[0]).parse_args()
+    p = argparse.ArgumentParser(prog="doctor", description=__doc__.split("\n")[0])
+    p.add_argument("--base", help="base branch of the repository under diagnosis (default: config `base_branch`)")
+    args = p.parse_args()
     try:
         config = load_config()
         models = configured_models(config)
@@ -257,7 +262,7 @@ def main():
             check_tool(tool)
         check_forge()
         top = check_tree()
-        check_base(top, config.get("base_branch"))
+        check_base(top, config.get("base_branch") if args.base is None else args.base)
         check_prices(config)
         check_models(models)
     except Missing as m:

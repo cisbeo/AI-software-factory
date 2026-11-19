@@ -48,6 +48,8 @@ Every stop records one of five exits in `job.json` `exit`: `success`,
 `<repo>` is the main checkout (`git rev-parse --show-toplevel` from your
 session). It stays the user's: you and the agents never change it except
 through the scripts. `factory/jobs/` is gitignored runtime state.
+Installing, reinstalling or uninstalling the factory (`factory/bin/factory
+install|uninstall`) is the user's to run, never yours.
 
 ```
 <repo>/factory/config.json                     concurrency, budgets, caps, labels, routing, prices
@@ -57,6 +59,8 @@ through the scripts. `factory/jobs/` is gitignored runtime state.
 <repo>/factory/bin/gate                        runs checks.sh in a worktree → round-N/checks.md
 <repo>/factory/bin/route                       risk + surfaces → the job's agents
 <repo>/factory/bin/forge                       the only door to the forge (tickets, merge requests)
+<repo>/factory/answers.json                    install answers (factory install); never edit it
+<repo>/factory/install-log.json                what factory install posed; factory uninstall reads it
 <repo>/factory/jobs/<job-id>/job.json          the job's state; the dashboard reads it
 <repo>/factory/jobs/<job-id>/issue.md          the issue, quoted as data
 <repo>/factory/jobs/<job-id>/intake.md         intake's decision, scope, risk, surfaces
