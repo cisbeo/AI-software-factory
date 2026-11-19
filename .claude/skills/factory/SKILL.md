@@ -25,8 +25,8 @@ intake (fable)     → ACCEPT (scope possibly changed) | NEEDS-INFO | REJECT, po
 route (script)     → reviewers + models from risk/surfaces via config.json
 worktree           → factory/<job-id> from origin/<base>
 spec-writer (opus) → spec.md
-builder (opus)     → commits; the first push opens a draft PR "Closes #<n>" with a visual overview
-gate (script)      → checks.sh; FAIL → builder gets the log, no reviewers spawned
+builder (opus)     → commits with Factory-* trailers; the first push opens a draft PR "Closes #<n>"
+gate (script)      → checks.sh, protected paths, commit trailers; FAIL → builder gets the log, no reviewers spawned
 reviewers (routed) → parallel, WAIT FOR ALL; CHANGES → builder → gate → reviewers
 approver (opus)    → APPROVE: sync origin/<base>, gate, forge mr merge at the gated head
                      ESCALATE: PR ready, decision as PR comment, label factory:needs-human
@@ -50,7 +50,8 @@ session). It stays the user's: you and the agents never change it except
 through the scripts. `factory/jobs/` is gitignored runtime state.
 
 ```
-<repo>/factory/config.json                     concurrency, rounds, labels, routing, prices
+<repo>/factory/config.json                     concurrency, budgets, caps, labels, routing, prices
+<repo>/factory/VERSION                         the factory's version, in every commit's Factory-Version
 <repo>/factory/checks.sh                       the repo's checks; the gate runs it
 <repo>/factory/bin/job                         the only writer of job.json
 <repo>/factory/bin/gate                        runs checks.sh in a worktree → round-N/checks.md
@@ -67,6 +68,10 @@ through the scripts. `factory/jobs/` is gitignored runtime state.
 <repo>/factory/jobs/<job-id>/feedback-<k>.md            the user's feedback on an escalated job
 <repo>/.worktrees/<job-id>/                    the job's worktree, on factory/<job-id>
 ```
+
+Each transition of a job with a PR rewrites the factory block of the PR body
+(verdicts per round, routing reason, retry budget spent, cost): that is what
+a human reads before merging. Don't edit it.
 
 Read `job.json` with `cat` when you need a field. Read agents' files only by
 their first line (`head -1`); the agents put the detail there for the next

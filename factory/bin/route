@@ -35,12 +35,14 @@ def main(argv):
     risk = CONFIG["routing"].get(intake["risk"]) or die(
         f"risk {intake['risk']!r} isn't in config.json routing ({', '.join(CONFIG['routing'])})")
     reviewers = dict(risk)
+    reason = [f"risk {intake['risk']} → {', '.join(risk) or 'none'}"]
     for surface in intake["surfaces"]:
         extra = CONFIG["surface_reviewers"].get(surface)
         if extra is None:
             die(f"surface {surface!r} isn't in config.json surface_reviewers ({', '.join(CONFIG['surface_reviewers'])})")
         reviewers.update(extra)
-    agents = {"reviewers": reviewers}
+        reason.append(f"surface {surface} → {', '.join(extra) or 'none'}")
+    agents = {"reviewers": reviewers, "reason": "; ".join(reason)}
     res = subprocess.run([job_bin, "agents", job_id, json.dumps(agents)], capture_output=True, text=True)
     if res.returncode != 0:
         die(res.stderr.strip())

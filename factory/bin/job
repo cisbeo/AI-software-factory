@@ -20,6 +20,9 @@ Usage:
   job agents <job> <json>        record the routed agent set (called by factory/bin/route)
   job sync <job>                 refresh reviews, gate and cost from the job's files
   job summary [<job>...]         table of jobs: issue, stage, PR, cost, time
+  job trailers <job> --agent A --model M
+                                 the trailers an agent commit of this job carries (spec §9):
+                                 Factory-Job, Factory-Agent, Factory-Model, Factory-Version
 
 <job> is a job id (004-dark-mode) or an issue number (12).
 
@@ -33,9 +36,15 @@ with the reason in decision.md. A gate INCONCLUSIVE verdict spends nothing:
 `advance <job> gate` reruns it once, then the job goes to needs-human. Every
 stop records one of five exits in job.json `exit`: success (merged), failure
 (rejected), timeout, budget, human (any other escalation or question).
+
+Traceability (spec §9). On every transition of a job that has a merge
+request, `job` rewrites the factory block of its body (between
+`<!-- factory:summary -->` markers): version, routing reason, retry budget
+spent, cost, and the gate and review verdicts of each round.
 """
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -52,6 +61,8 @@ CONFIG = json.loads((FACTORY / "config.json").read_text())
 LABELS = CONFIG["labels"]
 BASE = CONFIG["base_branch"]
 MARKER = "<!-- factory -->"
+SUMMARY_START, SUMMARY_END = "<!-- factory:summary -->", "<!-- /factory:summary -->"
+SCRIPT_AGENT = "job"  # the agent named in the trailers of job merge's own merge commit
 
 TRANSITIONS = {
     "intake": {"needs-info", "rejected", "spec"},
@@ -703,7 +714,99 @@ def enter(job, old, stage, exit_kind=None):
         job["exit"] = None
     job["stage"] = stage
     job["ended"] = now() if stopping else None
+    update_summary(job)
     return job
+
+
+# ---- Traceability (spec §9) ------------------------------------------------
+
+
+def factory_version():
+    """<factory/VERSION>+config.<first 12 hex of sha256(config.json)>."""
+    try:
+        version = (FACTORY / "VERSION").read_text()
+    except OSError:
+        version = None
+    require(version is not None and re.fullmatch(r"\d+\.\d+\.\d+\n?", version),
+            f"factory/VERSION is {version!r}, expected x.y.z")
+    digest = hashlib.sha256((FACTORY / "config.json").read_bytes()).hexdigest()[:12]
+    return f"{version.strip()}+config.{digest}"
+
+
+def trailer_text(job, agent, model):
+    return (f"Factory-Job: {job['id']}\nFactory-Agent: {agent}\nFactory-Model: {model}\n"
+            f"Factory-Version: {factory_version()}")
+
+
+def routing_reason(job):
+    agents = job.get("agents") or {}
+    if agents.get("reason"):
+        return agents["reason"]
+    i = job.get("intake") or {}
+    return (f"risk {i.get('risk')}, surfaces {', '.join(i.get('surfaces') or []) or 'none'} → "
+            + (", ".join(f"{r} ({m})" for r, m in (agents.get("reviewers") or {}).items()) or "not routed"))
+
+
+def round_verdicts(job, n):
+    rd = round_dir(job, n)
+    gate = header(rd / "checks.md").get("GATE") if (rd / "checks.md").exists() else "–"
+    reruns = len(list(rd.glob("checks-inconclusive-*.md")))
+    if reruns:
+        gate = "INCONCLUSIVE → " * reruns + gate
+    reviews = []
+    for r in reviewers(job) if job.get("agents") else []:
+        line = first_line(rd / f"review-{r}.md")
+        if line is None:
+            reviews.append("pending" if n == job["round"] and job["stage"] == "review" else "–")
+        else:
+            m = re.fullmatch(r"VERDICT:\s*(PASS|CHANGES)", line)
+            reviews.append(m.group(1) if m else "invalid")
+    return gate, reviews
+
+
+def summary_block(job):
+    budget = limits()[0]
+    names = reviewers(job) if job.get("agents") else []
+    lines = [
+        SUMMARY_START,
+        "## Factory",
+        "",
+        f"- Job: {job['id']} · stage {job['stage']}" + (f" · exit {job['exit']}" if job.get("exit") else ""),
+        f"- Factory-Version: {factory_version()}",
+        f"- Routing: {routing_reason(job)}",
+        f"- Retry budget: {budget - job['retries_left']} of {budget} spent",
+        f"- Cost: ${job['cost_usd']:.2f} (API-equivalent) · running time {round(active_seconds(job) / 60)} min",
+        "",
+        "| Round | Gate | " + " | ".join(names) + (" |" if names else ""),
+        "| --- | --- |" + " --- |" * len(names),
+    ]
+    for n in range(1, job["round"] + 1):
+        gate, reviews = round_verdicts(job, n)
+        lines.append(f"| {n} | {gate} | " + " | ".join(reviews) + (" |" if reviews else ""))
+    lines.append(SUMMARY_END)
+    return "\n".join(lines)
+
+
+def update_summary(job):
+    """Rewrite the factory block of the merge request's body; any other block
+    (planted or stale) between the markers goes."""
+    if not job.get("pr"):
+        return
+    body = forge_json("mr", "view", job["pr"])["body"] or ""
+    body = re.sub(rf"\n*{re.escape(SUMMARY_START)}.*?(?:{re.escape(SUMMARY_END)}|\Z)", "", body, flags=re.S)
+    body = body.replace(SUMMARY_START, "").replace(SUMMARY_END, "").rstrip()
+    forge("mr", "edit", job["pr"], "--body", f"{body}\n\n{summary_block(job)}\n".lstrip("\n"))
+
+
+def cmd_trailers(job, args):
+    if len(args) != 4 or args[0] != "--agent" or args[2] != "--model":
+        die("usage: job trailers <job> --agent A --model M")
+    agent, model = args[1], args[3]
+    if not (re.fullmatch(r"[a-z][a-z0-9-]*", agent) and (REPO / ".claude" / "agents" / f"{agent}.md").is_file()):
+        die(f"{agent!r} isn't an agent of .claude/agents/")
+    if model not in CONFIG["prices_usd_per_mtok"]:
+        die(f"{model!r} isn't a model of config.json prices_usd_per_mtok")
+    print(trailer_text(job, agent, model))
 
 
 # ---- Commands --------------------------------------------------------------
@@ -873,7 +976,9 @@ def cmd_merge(job):
         print(f"{job['id']}: needs-human: {why.splitlines()[0]}")
 
     git(job, "fetch", "origin", BASE)
-    merged = git(job, "merge", "--no-edit", f"origin/{BASE}", check=False)
+    merged = git(job, "merge", "--no-ff", "--no-edit", "-m",
+                 f"Merge origin/{BASE} into {job['branch']}\n\n{trailer_text(job, SCRIPT_AGENT, 'none')}",
+                 f"origin/{BASE}", check=False)
     if merged.returncode != 0:
         git(job, "merge", "--abort", check=False)
         return fail(f"The branch conflicts with {BASE}:\n\n```\n{merged.stdout.strip()}\n```")
@@ -985,6 +1090,8 @@ def main(argv):
             print(f"{job['id']}: {job['stage']} round {job['round']} gate {job['gate'] or '-'} {reviews}".rstrip())
         elif cmd == "summary":
             cmd_summary(args)
+        elif cmd == "trailers" and len(args) >= 1:
+            cmd_trailers(resolve(args[0]), args[1:])
         else:
             die(f"bad arguments: {' '.join(argv)}\n\n{__doc__.strip()}")
     except Stopped as e:

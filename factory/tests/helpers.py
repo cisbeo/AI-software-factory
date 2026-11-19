@@ -7,6 +7,7 @@ that logs its arguments and fails: a control that reaches the forge when it
 should refuse first shows up in the log.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -52,6 +53,7 @@ class FactoryCase(unittest.TestCase):
         (self.factory / "bin").mkdir(parents=True)
         for name in self.scripts:
             shutil.copy2(FACTORY_SRC / "bin" / name, self.factory / "bin" / name)
+        shutil.copy2(FACTORY_SRC / "VERSION", self.factory / "VERSION")
         self.config = json.loads((FACTORY_SRC / "config.json").read_text())
         self.write_config()
         self.jobs = self.factory / "jobs"
@@ -76,6 +78,17 @@ class FactoryCase(unittest.TestCase):
 
     def write_config(self):
         write(self.factory / "config.json", json.dumps(self.config, indent=2))
+
+    def factory_version(self):
+        """What `Factory-Version` must say for this copy of the factory."""
+        digest = hashlib.sha256((self.factory / "config.json").read_bytes()).hexdigest()[:12]
+        return f"{(self.factory / 'VERSION').read_text().strip()}+config.{digest}"
+
+    def trailers(self, job_id="001-test", agent="builder", model="claude-opus-5-5", **override):
+        fields = {"Factory-Job": job_id, "Factory-Agent": agent, "Factory-Model": model,
+                  "Factory-Version": self.factory_version()}
+        fields.update({k.replace("_", "-"): v for k, v in override.items()})
+        return "\n".join(f"{k}: {v}" for k, v in fields.items() if v is not None)
 
     def bin(self, name, *args, stdin=None):
         return run([sys.executable, "-B", str(self.factory / "bin" / name), *args],

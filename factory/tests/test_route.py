@@ -29,7 +29,13 @@ class Route(FactoryCase):
     def assert_routed(self, reviewers):
         res = self.route()
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertEqual(self.read_job()["agents"], {"reviewers": reviewers})
+        agents = self.read_job()["agents"]
+        self.assertEqual(agents["reviewers"], reviewers)
+        # The routing reason names the risk, each surface and the lenses they bring (spec §9).
+        intake = self.read_job()["intake"]
+        self.assertIn(f"risk {intake['risk']} → ", agents["reason"])
+        for surface in intake["surfaces"]:
+            self.assertIn(f"surface {surface} → ", agents["reason"])
 
     def assert_refused(self, res, says):
         self.assertEqual(res.returncode, 1, res.stdout + res.stderr)

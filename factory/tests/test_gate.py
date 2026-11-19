@@ -7,6 +7,8 @@ worktree on branch factory/<job-id>, cut from origin/main.
 Controls:
 - protected paths: a branch that modifies a protected file fails the gate.
 - base checks: the gate runs the main checkout's checks.sh, never the branch's.
+- trailers: every commit of the branch carries Factory-Job, Factory-Agent,
+  Factory-Model and Factory-Version (spec §9).
 - trace: every verdict leaves a trace in the job folder (command, exit code,
   commit checked).
 """
@@ -36,6 +38,7 @@ class GateCase(FactoryCase):
         write(self.factory / "checks.sh", self.base_checks, mode=0o755)
         write(self.root / "src" / "app.txt", "hello\n")
         write(self.root / "AGENTS.md", "# Agents\n")
+        write(self.root / ".claude" / "agents" / "builder.md", "---\nname: builder\n---\n")
         self.git(self.root, "init", "-q")
         self.git(self.root, "add", "-A")
         self.git(self.root, "commit", "-q", "-m", "base")
@@ -47,13 +50,19 @@ class GateCase(FactoryCase):
         self.make_job(JOB, stage="gate", round=1, worktree=str(self.worktree))
         (self.jobs / JOB / "round-1").mkdir()
 
-    def commit_on_branch(self, files, message="change"):
+    def commit_on_branch(self, files, message="change", trailers=True):
+        """Commit as the builder would: with the job's trailers (spec §9),
+        unless `trailers` is False or a ready-made trailer block."""
         for rel, text in files.items():
             if text is None:
                 (self.worktree / rel).unlink()
             else:
                 write(self.worktree / rel, text)
         self.git(self.worktree, "add", "-A")
+        if trailers is True:
+            trailers = self.trailers(JOB)
+        if trailers:
+            message += "\n\n" + trailers
         self.git(self.worktree, "commit", "-q", "-m", message)
         return self.git(self.worktree, "rev-parse", "HEAD")
 
@@ -213,6 +222,81 @@ class Inconclusive(GateCase):
             with self.subTest(code=code):
                 write(self.factory / "checks.sh", f"#!/usr/bin/env bash\nexit {code}\n", mode=0o755)
                 self.assert_verdict(self.gate(), "FAIL")
+
+
+class Trailers(GateCase):
+    def assert_untraced(self, res, *says):
+        self.assert_verdict(res, "FAIL")
+        md = self.checks_md()
+        self.assertIn("## Trailers", md)
+        for text in says:
+            self.assertIn(text, md)
+
+    # ---- blocked ----
+
+    def test_commit_without_trailers_fails(self):
+        head = self.commit_on_branch({"src/app.txt": "v2\n"}, trailers=False)
+        self.assert_untraced(self.gate(), head[:7], "Factory-Job", "Factory-Model")
+        [t] = self.traces()
+        self.assertEqual(t["verdict"], "FAIL")
+        self.assertTrue(t["trailers"])
+
+    def test_one_missing_trailer_fails(self):
+        self.commit_on_branch({"src/app.txt": "v2\n"}, trailers=self.trailers(JOB, model=None))
+        self.assert_untraced(self.gate(), "missing Factory-Model")
+
+    def test_one_untraced_commit_among_traced_ones_fails(self):
+        self.commit_on_branch({"src/a.txt": "a\n"})
+        bad = self.commit_on_branch({"src/b.txt": "b\n"}, trailers=False)
+        self.commit_on_branch({"src/c.txt": "c\n"})
+        self.assert_untraced(self.gate(), bad[:7])
+
+    def test_trailers_of_another_job_fail(self):
+        self.commit_on_branch({"src/app.txt": "v2\n"}, trailers=self.trailers("002-other"))
+        self.assert_untraced(self.gate(), "Factory-Job is '002-other'")
+
+    # ---- neighbours that pass ----
+
+    def test_traced_commits_pass(self):
+        self.commit_on_branch({"src/a.txt": "a\n"})
+        self.commit_on_branch({"src/b.txt": "b\n"}, trailers=self.trailers(JOB, model="claude-sonnet-5-5"))
+        self.assert_verdict(self.gate(), "PASS")
+        self.assertIn("Trailers: 2 commits traced", self.checks_md())
+
+    def test_base_sync_merge_by_job_passes(self):
+        self.commit_on_branch({"src/a.txt": "a\n"})
+        write(self.root / "src" / "base.txt", "new on main\n")
+        self.git(self.root, "add", "-A")
+        self.git(self.root, "commit", "-q", "-m", "main moves")
+        self.git(self.root, "push", "-q", "origin", "HEAD:main")
+        self.git(self.worktree, "fetch", "-q", "origin")
+        self.git(self.worktree, "merge", "-q", "--no-ff", "--no-edit", "origin/main", "-m",
+                 "Merge origin/main\n\n" + self.trailers(JOB, agent="job", model="none"))
+        self.assert_verdict(self.gate(), "PASS")
+
+    # ---- input not understood: fail, never pass ----
+
+    def test_unrecognized_trailer_values_fail(self):
+        cases = {
+            "unknown agent": dict(agent="intern"),
+            "unknown model": dict(model="gpt-5"),
+            "malformed version": dict(Factory_Version="latest"),
+            "empty job": dict(job_id=""),
+        }
+        for name, override in cases.items():
+            with self.subTest(name):
+                self.git(self.worktree, "reset", "-q", "--hard", "origin/main")
+                self.commit_on_branch({"src/app.txt": name + "\n"}, trailers=self.trailers(**{"job_id": JOB, **override}))
+                self.assert_verdict(self.gate(), "FAIL")
+
+    def test_duplicated_trailer_fails(self):
+        self.commit_on_branch({"src/app.txt": "v2\n"},
+                              trailers=self.trailers(JOB) + "\nFactory-Model: claude-haiku-5-5")
+        self.assert_untraced(self.gate(), "Factory-Model given twice")
+
+    def test_script_agent_on_an_ordinary_commit_fails(self):
+        self.commit_on_branch({"src/app.txt": "v2\n"}, trailers=self.trailers(JOB, agent="job", model="none"))
+        self.assert_untraced(self.gate(), "only on a merge commit")
 
 
 class Trace(GateCase):
