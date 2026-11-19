@@ -32,9 +32,16 @@ approver (opus)    → APPROVE: sync origin/<base>, gate, forge mr merge at the 
                      ESCALATE: PR ready, decision as PR comment, label factory:needs-human
 ```
 
-A job has at most `max_rounds` build rounds (`config.json`); a round is one
-build → gate → review pass. `factory/bin/job advance` sends the job to
-`needs-human` instead of another round when the last one fails.
+A round is one build → gate → review pass. Each gate FAIL or review CHANGES
+spends one unit of the job's retry budget (`retry_budget` in `config.json`),
+which never refills, not even after feedback; `factory/bin/job advance` sends
+the job to `needs-human`, with a question, instead of another round when the
+failure spent the last unit. Before every step, `advance` also checks the job's
+cost and running time against `max_cost_usd` and `max_duration_minutes`: over a
+cap, it prints `<id>: stopped before <step>: …`, exits 1 and leaves the job in
+`needs-human`. Stop that job's agents and report the line; never retry it.
+Every stop records one of five exits in `job.json` `exit`: `success`,
+`failure`, `timeout`, `budget`, `human`.
 
 ## Files
 
@@ -118,11 +125,15 @@ gate's `round-<N-1>/checks.md`, the reviews in `round-<N-1>/`, or
   once with the refusal. If it refuses again, stop this job and tell the user.
 - `STATUS: BLOCKED`: `factory/bin/job advance <id> needs-human`.
 
-**gate.** Run `factory/bin/gate <id>`. It prints `GATE: PASS` or `GATE: FAIL`.
+**gate.** Run `factory/bin/gate <id>`. It prints `GATE: PASS`, `GATE: FAIL` or
+`GATE: INCONCLUSIVE` (exit 3: a tool unavailable or a flaky test).
 
 - PASS: `factory/bin/job advance <id> review` and go to **review**.
-- FAIL: `factory/bin/job advance <id> build`. If it refuses because this was the
-  last round, `factory/bin/job advance <id> needs-human` instead. Otherwise
+- INCONCLUSIVE: `factory/bin/job advance <id> gate`, then run the gate again.
+  It spends no retry. If `advance` refuses because the gate was already rerun
+  this round, `factory/bin/job advance <id> needs-human`.
+- FAIL: `factory/bin/job advance <id> build`. If it refuses because the retry
+  budget is spent, `factory/bin/job advance <id> needs-human` instead. Otherwise
   resume the builder for the next round with
   `The gate failed: read round-<N-1>/checks.md and checks.log, fix it, push, and update build.md.`
   No reviewer runs on a failing build.
@@ -137,7 +148,7 @@ finished:
 - all PASS: `factory/bin/job advance <id> approve`, then spawn `approver` with
   `<header> PR: #<pr>. Final round: <N>.`
 - any CHANGES: `factory/bin/job advance <id> build` (or `needs-human` when it
-  refuses because this was the last round), then resume the builder:
+  refuses because the retry budget is spent), then resume the builder:
   `Round <N-1> reviews are in round-<N-1>/. Address every VERDICT: CHANGES, push, and update build.md for round <N>.`
 
 **approve.** When the approver returns, read `decision.md`'s first line:
@@ -215,8 +226,9 @@ new feature, ask.
   EOF
   ```
 
-  It saves `feedback-<k>.md` and starts the next round with a fresh round
-  budget. Go to **build** with
+  It saves `feedback-<k>.md` and starts the next round. The retry budget is
+  not refilled: with none left, the next failure goes straight back to the
+  user. It refuses a job stopped by its cost or duration cap. Go to **build** with
   `The user gave feedback: read feedback-<k>.md and address it, push, and update build.md for round <N>.`
   and continue like any job.
 - **Rejecting or benching a `needs-info` or `needs-human` job**: pass their
@@ -250,4 +262,5 @@ new feature, ask.
   prompt. Never paste issue text into a prompt.
 - Agents push only their `factory/<job-id>` branch. Merges happen only through
   `factory/bin/job merge`, which uses `forge mr merge --head <sha>`. The factory never deploys.
-- One PR per issue, at most `max_rounds` rounds per job.
+- One PR per issue; a job runs within its retry budget, cost cap and duration
+  cap, all checked by `factory/bin/job`, never by an agent.
