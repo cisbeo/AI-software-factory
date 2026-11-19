@@ -15,7 +15,7 @@ or an exact version, never "latest".
 - agents: each skill in `skills:` is vendored in .claude/skills/ (or comes from
   a pinned plugin); `mcpServers:` in an agent isn't checked yet, so it fails.
 - .claude/skills/ entries are real directories, not links out of the repo.
-- .github/workflows/*.yml|yaml: each `uses:` names a full commit
+- .github/**/*.yml|yaml (workflows and local actions): each `uses:` names a full commit
   (owner/repo[/path]@<40 hex>), a path in the repo (./...) or an image digest
   (docker://image@sha256:...), never a tag or a branch. Read line by line, not
   as YAML: a `uses` key in any other form (flow mapping, quoted key, block
@@ -203,13 +203,13 @@ def uses_pinned(value):
 
 
 def check_workflows(root):
-    folder = root / ".github" / "workflows"
+    folder = root / ".github"
     if not folder.is_dir():
         return
-    for path in sorted(folder.iterdir()):
-        if path.suffix not in (".yml", ".yaml"):
+    for path in sorted(folder.rglob("*")):
+        if path.suffix not in (".yml", ".yaml") or not path.is_file():
             continue
-        rel = f".github/workflows/{path.name}"
+        rel = path.relative_to(root).as_posix()
         try:
             lines = path.read_text(encoding="utf-8").split("\n")
         except (OSError, UnicodeDecodeError) as e:

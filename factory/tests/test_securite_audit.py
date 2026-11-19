@@ -199,6 +199,12 @@ class WorkflowPins(AuditCase):
               "on: push\njobs:\n  call:\n    uses: o/r/.github/workflows/ci.yml@v1\n")
         self.assertProblem(".github/workflows/w.yaml:4")
 
+    def test_local_action_is_checked_too(self):
+        write(self.root / ".github" / "actions" / "local" / "action.yml",
+              "runs:\n  using: composite\n  steps:\n    - uses: actions/cache@v4\n")
+        self.workflow("      - uses: ./.github/actions/local\n")
+        self.assertProblem(".github/actions/local/action.yml:4")
+
     def test_pinned_neighbours_pass(self):
         self.workflow(f"      - uses: actions/checkout@{SHA} # v7.0.1\n"
                       f"      - name: x\n        uses: \"actions/setup-python@{SHA}\"\n"

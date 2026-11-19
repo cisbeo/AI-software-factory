@@ -34,6 +34,7 @@
   ],
   "protected_trees": [
     ".claude/*",
+    ".github/workflows/*",
     "factory/bin/*",
     "agents.md",
     "*/agents.md",
