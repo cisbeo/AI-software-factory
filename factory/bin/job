@@ -143,21 +143,37 @@ def require_slot(job_id):
             f"concurrency {CONCURRENCY} reached; running: {', '.join(busy)}")
 
 
-MIGRATION_STAGES = {"build", "gate", "review", "approve", "merging"}
+SERIAL_STAGES = {"build", "gate", "review", "approve", "merging"}
 
 
 def has_migration(job):
-    return "migration" in ((job.get("intake") or {}).get("surfaces") or [])
+    return "migration" in job_surfaces(job)
 
 
-def require_migration_lock(job):
-    """One migration job builds at a time: parallel jobs would all generate the
-    same next drizzle/NNNN migration. checks.sh catches one that slips through."""
-    if not has_migration(job):
-        return
-    busy = [j["id"] for j in all_jobs()
-            if j["id"] != job["id"] and j["stage"] in MIGRATION_STAGES and has_migration(j)]
-    require(not busy, f"another migration job is building: {', '.join(busy)}; retry once it is done")
+def job_surfaces(job):
+    return set((job.get("intake") or {}).get("surfaces") or [])
+
+
+def serial_surfaces():
+    """config `serial_surfaces`: surfaces on which one job builds at a time."""
+    value = CONFIG.get("serial_surfaces")
+    known = set(CONFIG["surface_reviewers"])
+    if not isinstance(value, list) or not all(isinstance(s, str) and s in known for s in value):
+        raise Refused(f"config.json: serial_surfaces is {value!r}, expected a list of surfaces "
+                      f"from surface_reviewers ({', '.join(sorted(known))})")
+    return set(value)
+
+
+def require_serial_surfaces(job):
+    """Two jobs on a serial surface (a schema migration, say) would race: both
+    would write the next change of the same sequence, whatever the target
+    repo's tooling. checks.sh catches one that slips through."""
+    serial = serial_surfaces() & job_surfaces(job)
+    for surface in sorted(serial):
+        busy = [j["id"] for j in all_jobs()
+                if j["id"] != job["id"] and j["stage"] in SERIAL_STAGES and surface in job_surfaces(j)]
+        require(not busy, f"serial surface {surface}: another job is building on it: "
+                          f"{', '.join(busy)}; retry once it is done")
 
 
 def resolve(arg):
@@ -465,7 +481,7 @@ def advance(job, stage):
 
     elif old == "spec":
         require((d / "spec.md").exists(), "spec.md doesn't exist")
-        require_migration_lock(job)
+        require_serial_surfaces(job)
         next_round(job)
 
     elif old == "build" and stage == "gate":

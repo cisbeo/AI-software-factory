@@ -54,7 +54,8 @@ For ACCEPT, rate:
 - **Surfaces**: `ui` if a user will see the change on a page or screen,
   `security` if it touches auth, permissions, user input reaching queries,
   shells or HTML, secrets, or payments, `migration` if it adds or changes a
-  Drizzle migration (schema change; only one such job builds at a time).
+  schema migration (only one job builds at a time on a surface listed in
+  `serial_surfaces` in `factory/config.json`).
   Any combination, or `none`.
 
 ## Write intake.md
