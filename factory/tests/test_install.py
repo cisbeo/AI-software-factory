@@ -514,6 +514,7 @@ class Replay(InstallCase):
         calls = len(self.world.log.read_text().splitlines())
         res = self.ok(self.install(stdin=""))  # answers come from factory/answers.json
         self.assertIn("aucun écart", res.stdout)
+        self.assertNotIn("réglages Claude existants", res.stdout)  # the factory's own aren't a risk
         self.assertNotIn("créer ", res.stdout)
         self.assertNotIn("? ", res.stdout)
         self.assertEqual((self.target / "factory/install-log.json").read_text(), journal)

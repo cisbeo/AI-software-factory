@@ -609,8 +609,12 @@ def readiness(facts, answers, claimed):
     if answers.get("deploy_target", "aucune") != "aucune":
         risky.append(f"cible de déploiement « {answers['deploy_target']} » notée ; les composants de la "
                      "section 12 ne sont pas encore construits")
-    if facts["claude"]:
-        risky.append(f"réglages Claude existants ({', '.join(facts['claude'])}) : ils s'exécutent dans les "
+    def foreign(entry):  # a Claude setting not posed by the factory
+        inside = [f for f in facts["files"] if f == entry or f.startswith(entry + "/")]
+        return entry not in claimed and (not inside or any(f not in claimed for f in inside))
+    others = [c for c in facts["claude"] if foreign(c)]
+    if others:
+        risky.append(f"réglages Claude existants ({', '.join(others)}) : ils s'exécutent dans les "
                      "sessions des agents, relis-les")
     if facts["git_hooks"]:
         risky.append(f"hooks git ({', '.join(facts['git_hooks'])}) : ils s'exécutent aux commits des agents")
