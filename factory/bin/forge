@@ -9,6 +9,7 @@ usage errors exit 2.
 
 Usage:
   forge whoami                                  {"login"}
+  forge permissions                             {"push", "label", "merge"}: the account's rights here
   forge tickets --label L                       open tickets carrying L, with their unfinished blockers
   forge blockers <n>                            unfinished tickets blocking <n>
   forge ticket view <n> [--allow LOGIN]...      ticket, with only the comments of its author,
@@ -75,6 +76,7 @@ class Forge:
     per-repository ticket and merge request numbers."""
 
     def whoami(self): raise NotImplementedError
+    def permissions(self): raise NotImplementedError
     def tickets(self, label): raise NotImplementedError
     def mrs(self): raise NotImplementedError
     def blockers(self, number): raise NotImplementedError
@@ -119,6 +121,8 @@ class GitHub(Forge):
                                  input=json.dumps(payload) if payload is not None else None)
         except FileNotFoundError:
             raise ForgeError("`gh` est introuvable ; installe GitHub CLI et connecte-toi (`gh auth login`)")
+        if res.returncode == 4:  # gh's exit status when no account is logged in
+            raise ForgeError("`gh` n'est pas authentifié ; connecte-toi avec `gh auth login`")
         if res.returncode != 0:
             err = (res.stderr or res.stdout).strip()
             m = re.search(r"\(HTTP (\d+)\)", err)
@@ -127,7 +131,7 @@ class GitHub(Forge):
 
     def api(self, method, path, payload=None, paginate=False):
         repo = self.repo or "{owner}/{repo}"
-        endpoint = path if path == "user" else f"repos/{repo}/{path}"
+        endpoint = path if path == "user" else f"repos/{repo}/{path}" if path else f"repos/{repo}"
         args = ["api", "-X", method, endpoint]
         if paginate:
             args += ["--paginate", "--slurp"]
@@ -159,6 +163,15 @@ class GitHub(Forge):
 
     def whoami(self):
         return {"login": self.api("GET", "user")["login"]}
+
+    def permissions(self):
+        perms = (self.api("GET", "") or {}).get("permissions")
+        if not isinstance(perms, dict) or not all(isinstance(perms.get(k, False), bool)
+                                                  for k in ("admin", "maintain", "push", "triage")):
+            raise ForgeError(f"droits du compte sur le dépôt illisibles : {perms!r}")
+        write = any(perms.get(k) for k in ("admin", "maintain", "push"))
+        # Triage may label tickets but neither push nor merge.
+        return {"push": write, "label": write or bool(perms.get("triage")), "merge": write}
 
     def tickets(self, label):
         issues = self.api("GET", f"issues?state=open&labels={quote(label)}&per_page=100", paginate=True)
@@ -386,6 +399,7 @@ def parser():
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("whoami")
     sub.add_parser("mrs")
+    sub.add_parser("permissions")
     s = sub.add_parser("tickets")
     s.add_argument("--label", required=True)
     s = sub.add_parser("blockers")
@@ -442,6 +456,8 @@ def run(args):
     f = adapter()
     if args.cmd == "whoami":
         return f.whoami()
+    if args.cmd == "permissions":
+        return f.permissions()
     if args.cmd == "tickets":
         return f.tickets(args.label)
     if args.cmd == "mrs":
