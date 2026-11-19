@@ -23,15 +23,16 @@ Usage:
   forge mr ready <n>                            draft → ready for review
   forge mr comment <n> [--body B | --body-file F]
   forge mr close <n>
-  forge mr status <n>                           checks (pass|fail|pending|skipped) and approvals
+  forge mr status <n>                           checks (pass|fail|pending|skipped), approvals given on
+                                                the current head, stale approvals, changes requested
   forge mr merge <n> --head SHA [--method merge|squash|rebase]
                                                 merges only if the request's head is SHA
   forge protection <branch>                     protection of a base branch
 
 Blockers are the forge's native « blocked by » relation, plus the written
 convention « Bloqué par #n » in the ticket body (the fallback where the
-relation doesn't exist or isn't readable). A written blocker that can't be
-read counts as open: waiting costs nothing, starting a blocked ticket costs a job.
+relation doesn't exist). A native relation that exists but can't be read
+is an error. A written blocker that can't be read counts as open: waiting costs nothing, starting a blocked ticket costs a job.
 
 Environment: FORGE picks the adapter (default: `forge` in factory/config.json,
 else github). FORGE_REPO=owner/name targets another repository than the
@@ -172,10 +173,11 @@ class GitHub(Forge):
             native = self.api("GET", f"issues/{n}/dependencies/blocked_by?per_page=100", paginate=True)
             open_ |= {b["number"] for b in native if b["state"] == "open"}
         except GhError as e:
-            if e.status not in (403, 404, 410):
-                raise
-            # No native relation here (older GitHub Enterprise, token without access):
-            # the written convention below is the fallback.
+            if e.status not in (404, 410):
+                # Readable but refused (403…): fail closed rather than miss a blocker.
+                raise ForgeError(f"bloqueurs du ticket #{n} illisibles : {e}")
+            # No native relation on this forge instance: the written convention
+            # below is the fallback.
         for b in written_blockers(issue.get("body")) - open_ - {n}:
             try:
                 if self.api("GET", f"issues/{b}")["state"] == "open":
@@ -273,16 +275,22 @@ class GitHub(Forge):
         last = {}
         for r in self.api("GET", f"pulls/{int(number)}/reviews?per_page=100", paginate=True):
             if r["state"] in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
-                last[r["user"]["login"]] = r["state"]
+                last[r["user"]["login"]] = (r["state"], r.get("commit_id"))
+        # An approval counts only for the commit it was given on.
         return {"head_sha": sha, "checks": checks,
-                "approved_by": sorted(u for u, s in last.items() if s == "APPROVED"),
-                "changes_requested_by": sorted(u for u, s in last.items() if s == "CHANGES_REQUESTED")}
+                "approved_by": sorted(u for u, (s, c) in last.items() if s == "APPROVED" and c == sha),
+                "stale_approved_by": sorted(u for u, (s, c) in last.items() if s == "APPROVED" and c != sha),
+                "changes_requested_by": sorted(u for u, (s, _) in last.items() if s == "CHANGES_REQUESTED")}
 
     def mr_merge(self, number, head, method):
-        # `gh pr merge --match-head-commit` exists (gh ≥ 2.x) but goes through GraphQL;
+        # `gh pr merge --match-head-commit` exists (checked in gh 2.104.0) but goes through GraphQL;
         # the REST `sha` parameter gives the same guarantee: GitHub refuses (409) when
         # the head is no longer that commit.
-        self.pull(number)
+        if not re.fullmatch(r"[0-9a-f]{40}", head or ""):
+            raise ForgeError(f"--head doit être le SHA complet d'un commit (40 caractères hexadécimaux), pas {head!r}")
+        current = self.pull(number)["head"]["sha"]
+        if current != head:
+            raise ForgeError(f"la tête de la demande de fusion #{number} est {current}, pas {head} : fusion refusée")
         try:
             out = self.api("PUT", f"pulls/{int(number)}/merge", {"sha": head, "merge_method": method})
         except GhError as e:
@@ -308,7 +316,9 @@ class GitHub(Forge):
                 raise ForgeError(f"protection de {branch} illisible : {e}")
         try:
             rules = self.api("GET", f"rules/branches/{quote(branch, safe='')}")
-        except GhError:
+        except GhError as e:
+            if e.status != 404:
+                raise ForgeError(f"règles de {branch} illisibles : {e}")
             rules = []
         out["rules"] = sorted({r["type"] for r in rules})
         if rules:

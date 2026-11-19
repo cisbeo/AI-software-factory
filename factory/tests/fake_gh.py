@@ -7,7 +7,7 @@ rewrites after each call. Errors look like gh's: a JSON body on stdout,
 `gh: <message> (HTTP <code>)` on stderr, exit status 1.
 
 State keys: user, next, issues, comments, deps, deps_unavailable, pulls,
-check_runs, statuses, reviews, protection, rules.
+check_runs, statuses, reviews, protection, rules, rules_error.
 """
 
 import hashlib
@@ -112,7 +112,7 @@ def route(state, method, path, query, payload):
     if mm := re.fullmatch(r"issues/(\d+)/dependencies/blocked_by", rest):
         issue_or_404(state, mm.group(1))
         if state.get("deps_unavailable"):
-            raise HttpError(404, "Not Found")
+            raise HttpError(state["deps_unavailable"], "Not Found" if state["deps_unavailable"] == 404 else "Forbidden")
         if method == "GET":
             return [state["issues"][str(b)] for b in state["deps"].get(mm.group(1), [])]
 
@@ -169,6 +169,8 @@ def route(state, method, path, query, payload):
             raise HttpError(404, "Branch not protected")
         return prot
     if mm := re.fullmatch(r"rules/branches/([^/]+)", rest):
+        if state.get("rules_error"):
+            raise HttpError(state["rules_error"], "Server Error")
         return state["rules"].get(unquote(mm.group(1)), [])
     raise HttpError(404, "Not Found")
 

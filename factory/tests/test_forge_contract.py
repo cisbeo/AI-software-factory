@@ -104,8 +104,11 @@ class FakeWorld:
     def block(self, n, by):
         self.edit(lambda s: s["deps"].setdefault(str(n), []).append(by))
 
-    def without_native_dependencies(self):
-        self.edit(lambda s: s.update(deps_unavailable=True))
+    def without_native_dependencies(self, code=404):
+        self.edit(lambda s: s.update(deps_unavailable=code))
+
+    def rules_unreadable(self):
+        self.edit(lambda s: s.update(rules_error=500))
 
     def mr(self, title="Change", body="", draft=True):
         head = f"forge-test-{uuid.uuid4().hex[:8]}"
@@ -157,9 +160,10 @@ class FakeWorld:
     def status(self, sha, context, state):
         self.edit(lambda s: s["statuses"].setdefault(sha, []).append({"context": context, "state": state}))
 
-    def review(self, n, author, state):
+    def review(self, n, author, state, commit=None):
+        sha = commit or self.head_sha(n)
         self.edit(lambda s: s["reviews"].setdefault(str(n), []).append(
-            {"user": {"login": author}, "state": state}))
+            {"user": {"login": author}, "state": state, "commit_id": sha}))
 
     def protect(self, branch, protection):
         self.edit(lambda s: s["protection"].update({branch: protection}))
@@ -214,8 +218,11 @@ class LiveWorld:
         issue_id = self.api(self.r(f"issues/{by}"))["id"]
         self.api(self.r(f"issues/{n}/dependencies/blocked_by"), "POST", {"issue_id": issue_id})
 
-    def without_native_dependencies(self):
+    def without_native_dependencies(self, code=404):
         self.skip("native dependencies can't be switched off")
+
+    def rules_unreadable(self):
+        self.skip("rulesets can't be made unreadable")
 
     def branch(self):
         head = f"forge-test-{uuid.uuid4().hex[:8]}"
@@ -355,6 +362,14 @@ class ForgeContract(unittest.TestCase):
         self.world.without_native_dependencies()
         self.assertEqual(self.forge_json("blockers", str(n)), [b])
 
+    def test_unreadable_native_relation_fails_closed(self):
+        b = self.world.ticket("blocker")
+        n = self.world.ticket("blocked", labels=[self.label])
+        self.world.block(n, b)
+        self.world.without_native_dependencies(code=403)
+        self.forge_fails("blockers", str(n))
+        self.forge_fails("tickets", "--label", self.label)
+
     def test_unknown_written_blocker_counts_as_blocking(self):
         n = self.world.ticket("blocked", body="Bloqué par #99999")
         self.assertEqual(self.forge_json("blockers", str(n)), [99999])
@@ -485,6 +500,17 @@ class ForgeContract(unittest.TestCase):
         self.assertEqual(st["approved_by"], ["alice", "carol"])
         self.assertEqual(st["changes_requested_by"], ["bob"])
 
+    def test_mr_status_counts_only_approvals_of_the_current_head(self):
+        n, _ = self.world.mr()
+        old = self.world.head_sha(n)
+        self.world.review(n, "alice", "APPROVED")
+        self.world.push(n)
+        self.world.review(n, "bob", "APPROVED")
+        st = self.forge_json("mr", "status", str(n))
+        self.assertEqual(st["approved_by"], ["bob"])
+        self.assertEqual(st["stale_approved_by"], ["alice"])
+        self.assertNotEqual(st["head_sha"], old)
+
     def test_mr_status_of_a_request_without_checks(self):
         n, _ = self.world.mr()
         st = self.forge_json("mr", "status", str(n))
@@ -493,6 +519,13 @@ class ForgeContract(unittest.TestCase):
     def test_merge_requires_the_head_commit(self):
         n, _ = self.world.mr(draft=False)
         self.assertEqual(self.forge("mr", "merge", str(n)).returncode, 2)
+        self.assertFalse(self.world.is_merged(n))
+
+    def test_merge_refuses_a_head_that_is_not_a_full_commit_sha(self):
+        n, _ = self.world.mr(draft=False)
+        for head in ("", "main", self.world.head_sha(n)[:7], "HEAD"):
+            res = self.forge("mr", "merge", str(n), "--head", head)
+            self.assertNotEqual(res.returncode, 0, head)
         self.assertFalse(self.world.is_merged(n))
 
     def test_merge_refuses_when_the_head_moved(self):
@@ -534,6 +567,10 @@ class ForgeContract(unittest.TestCase):
         p = self.forge_json("protection", "main")
         self.assertEqual((p["protected"], p["required_checks"], p["required_approvals"], p["enforce_admins"]),
                          (True, ["gate", "test"], 1, True))
+
+    def test_unreadable_rulesets_fail_closed(self):
+        self.world.rules_unreadable()
+        self.forge_fails("protection", "main")
 
     # ---- adapters -----------------------------------------------------------
 
