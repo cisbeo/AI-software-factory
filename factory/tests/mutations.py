@@ -26,6 +26,8 @@ MUTATIONS = [
  ("route: risque inconnu accepté", "factory/bin/route", 'risk = CONFIG["routing"].get(intake["risk"]) or die(', 'risk = CONFIG["routing"].get(intake["risk"]) or CONFIG["routing"]["low"] or die(', "test_route"),
  ("route: risque faible routé comme moyen", "factory/bin/route", 'reviewers = dict(risk)', 'reviewers = dict(CONFIG["routing"]["medium"]) if intake["risk"] == "low" else dict(risk)', "test_route"),
  ("route: surface inconnue ignorée", "factory/bin/route", 'if extra is None:\n            die(', 'if extra is None:\n            continue\n            die(', "test_route"),
+ ("job: surface sérialisée partagée", "factory/bin/job", 'require(not busy, f"serial surface {surface}', 'require(True, f"serial surface {surface}', "test_serial_surfaces"),
+ ("job: serial_surfaces malformé accepté", "factory/bin/job", 'if not isinstance(value, list) or not all(', 'if False and not all(', "test_serial_surfaces"),
  ("gate: trace non écrite", "factory/bin/gate", 'f.write(json.dumps(trace) + "\\n")', 'pass', "test_gate.Trace"),
  ("doctor: version minimale ignorée", "factory/bin/doctor", 'if v < MINIMUM[name]:', 'if False:', "test_doctor.Tools"),
  ("doctor: version illisible acceptée", "factory/bin/doctor", 'm.groups()) if m else None', 'm.groups()) if m else (99, 0, 0)', "test_doctor.Tools"),

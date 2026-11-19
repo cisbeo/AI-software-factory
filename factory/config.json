@@ -19,6 +19,7 @@
     "security": { "security": "opus" },
     "migration": {}
   },
+  "serial_surfaces": ["migration"],
   "protected_paths": [
     "factory/checks.sh",
     "factory/config.json",
