@@ -74,6 +74,9 @@ class ThisRepo(unittest.TestCase):
         res = run([sys.executable, "-B", str(FACTORY_SRC / "bin" / "audit")])
         self.assertEqual(res.returncode, 0, res.stderr)
 
+    def test_essai_29_doit_echouer(self):
+        self.fail("test cassé exprès : preuve que la CI bloque (#29)")
+
 
 class Pins(AuditCase):
     def test_baseline_passes(self):
