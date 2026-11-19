@@ -34,6 +34,7 @@ MUTATIONS = [
  ("doctor: base en retard acceptée", "factory/bin/doctor", 'if local_sha == remote_sha:', 'if True:', "test_doctor.BaseBranch"),
  ("doctor: tarifs anciens non signalés", "factory/bin/doctor", 'if age > PRICES_MAX_AGE_DAYS:', 'if False:', "test_doctor.Prices"),
  ("doctor: modèle refusé accepté", "factory/bin/doctor", 'if answer["is_error"] or res.returncode != 0:', 'if False:', "test_doctor.Models"),
+ ("doctor: invite avalée par --tools", "factory/bin/doctor", 'cwd=scratch, timeout=MODEL_TIMEOUT_S, stdin="Réponds seulement : OK")', 'cwd=scratch, timeout=MODEL_TIMEOUT_S)', "test_doctor.Models"),
  ("forge: le triage compte comme écriture", "factory/bin/forge", 'write = any(perms.get(k) for k in ("admin", "maintain", "push"))', 'write = any(perms.get(k) for k in ("admin", "maintain", "push", "triage"))', "test_forge_contract"),
 ]
 

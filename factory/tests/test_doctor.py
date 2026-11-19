@@ -22,11 +22,24 @@ FAKE_CLAUDE = """#!/bin/sh
 # claude double: version from FAKE_CLAUDE_VERSION, models refused when named in FAKE_CLAUDE_DENY.
 if [ "$1" = "--version" ]; then echo "$FAKE_CLAUDE_VERSION"; exit 0; fi
 printf '%s\\n' "claude $*" >> "$FAKE_CLAUDE_LOG"
-model=""
+# Like the real one: `--tools` takes every value up to the next option, so the
+# prompt can't follow it on the command line; without a prompt, -p fails.
+model=""; prompt=""; in_tools=""
 while [ $# -gt 0 ]; do
-  if [ "$1" = "--model" ]; then model="$2"; fi
+  case "$1" in
+    --model) model="$2"; in_tools=""; shift;;
+    --output-format|--setting-sources|--max-budget-usd) in_tools=""; shift;;
+    --tools) in_tools=1;;
+    -*) in_tools="";;
+    *) [ -z "$in_tools" ] && prompt="$1";;
+  esac
   shift
 done
+[ -z "$prompt" ] && prompt="$(cat)"
+if [ -z "$prompt" ]; then
+  echo "Error: Input must be provided either through stdin or as a prompt argument when using --print" >&2
+  exit 1
+fi
 if [ -n "$FAKE_CLAUDE_RAW" ]; then echo "$FAKE_CLAUDE_RAW"; exit 0; fi
 case " $FAKE_CLAUDE_DENY " in
   *" $model "*) echo '{"type":"result","is_error":true,"result":"model not available"}'; exit 1;;
@@ -90,7 +103,8 @@ class DoctorCase(FactoryCase):
         self.gh_state.write_text(json.dumps(state))
 
     def doctor(self):
-        return self.bin("doctor")
+        # An empty stdin, so a prompt that never reaches the claude double can't come from ours.
+        return self.bin("doctor", stdin="")
 
     def passes(self):
         res = self.doctor()

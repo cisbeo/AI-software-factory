@@ -63,9 +63,9 @@ def warn(label, detail):
     print(f"warn  {label} : {detail}", flush=True)
 
 
-def sh(*cmd, cwd=None, timeout=60):
+def sh(*cmd, cwd=None, timeout=60, stdin=None):
     try:
-        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, input=stdin)
     except FileNotFoundError:
         return None
 
@@ -227,11 +227,12 @@ def check_prices(config):
 
 def check_models(models):
     # Run outside the repository so no project setting, hook or instruction file is loaded.
+    # The prompt goes on stdin: `--tools` takes several values and would swallow it.
     with tempfile.TemporaryDirectory(prefix="factory-doctor-") as scratch:
         for model in models:
             res = sh("claude", "-p", "--model", model, "--output-format", "json",
-                     "--no-session-persistence", "--tools", "", "Réponds seulement : OK",
-                     cwd=scratch, timeout=MODEL_TIMEOUT_S)
+                     "--no-session-persistence", "--tools", "",
+                     cwd=scratch, timeout=MODEL_TIMEOUT_S, stdin="Réponds seulement : OK")
             if res is None:
                 raise Missing("claude introuvable dans le PATH", INSTALL["claude"])
             try:
