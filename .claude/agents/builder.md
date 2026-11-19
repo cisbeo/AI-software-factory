@@ -91,6 +91,13 @@ command you ran and its result, or what the page showed.
 
 - Commit on the job branch with short one-line messages in the style of
   `git log --oneline`. One commit per distinct piece of work.
+- Every commit ends with the factory's trailers (spec §9), or the gate fails
+  the branch. Commit in one command, with your exact model id (for example
+  `claude-opus-5-5`, from your system prompt):
+  `cd <worktree> && T=$("$CLAUDE_PROJECT_DIR"/factory/bin/job trailers <job-id> --agent builder --model <model id>) && git commit -m "<message>" -m "$T"`.
+  The trailers must be the message's last paragraph; add nothing after them.
+  If `job trailers` refuses, don't commit without them: fix the model id, or
+  stop with STATUS: BLOCKED.
 - Stage explicit paths, never `git add -A`. Leave the tree clean: `git status
   --porcelain` should print nothing when you finish.
 - Push with `git push -u origin <branch>`. Push only the job branch, never
@@ -105,7 +112,9 @@ command you ran and its result, or what the page showed.
   just push; the commits update themselves, but the body does not: on every
   later round, rewrite the section to match the branch with
   `forge mr edit <number> --body-file <file>` (keep `Closes #<issue>` and the
-  Summary). Never mark the merge request ready and never merge it.
+  Summary). Leave out the block between `<!-- factory:summary -->` and
+  `<!-- /factory:summary -->`: `factory/bin/job` owns it and rewrites it on
+  every transition. Never mark the merge request ready and never merge it.
 
 ## PR body
 
