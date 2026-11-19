@@ -12,6 +12,10 @@ branch modifies or deletes a file matching config.json `protected_paths`
 (fnmatch patterns, where `*` also matches `/`, matched case-insensitively).
 Adding new files is fine, except under `protected_trees`, where an addition
 (or a rename into the tree) fails too.
+
+Each verdict appends a line to factory/jobs/<job-id>/trace.jsonl: the gate's
+command, the checks command and its directory, exit codes, verdict and the
+commit checked (spec §7.2).
 """
 
 import fnmatch
@@ -19,6 +23,7 @@ import json
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -84,9 +89,13 @@ def protected_changes(worktree):
     return hits
 
 
+def checks_command():
+    return ["bash", str(CHECKS)]
+
+
 def run_checks(worktree):
     start = time.monotonic()
-    res = subprocess.run(["bash", str(CHECKS)], cwd=worktree, capture_output=True, text=True)
+    res = subprocess.run(checks_command(), cwd=worktree, capture_output=True, text=True)
     return res.returncode, res.stdout + res.stderr, int(time.monotonic() - start)
 
 
@@ -115,9 +124,26 @@ def gate(job_id, merge):
         + ("\n".join(f"- {p}" for p in protected) if protected else "None changed.")
         + f"\n\n## checks.sh\nExit {code} in {seconds}s. Last {TAIL} lines of {name}.log:\n\n```\n{tail}\n```\n"
     )
+    exit_code = 0 if verdict == "PASS" else 1
+    trace = {
+        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "control": "gate",
+        "command": [sys.argv[0], *sys.argv[1:]],
+        "checks_command": checks_command(),
+        "cwd": str(worktree),
+        "commit": commit,
+        "round": job["round"],
+        "merge": merge,
+        "checks_exit": code,
+        "protected": protected,
+        "verdict": verdict,
+        "exit": exit_code,
+    }
+    with open(FACTORY / "jobs" / job_id / "trace.jsonl", "a") as f:
+        f.write(json.dumps(trace) + "\n")
     print(f"GATE: {verdict} ({job_id} round {job['round']}, checks.sh exit {code} in {seconds}s"
           + (f", protected paths changed: {', '.join(protected)}" if protected else "") + ")")
-    sys.exit(0 if verdict == "PASS" else 1)
+    sys.exit(exit_code)
 
 
 def hook():
