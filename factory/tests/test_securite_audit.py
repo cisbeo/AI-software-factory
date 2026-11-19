@@ -170,6 +170,66 @@ class Pins(AuditCase):
                 self.assertNotIn("Traceback", res.stderr)
 
 
+class WorkflowPins(AuditCase):
+    """Each `uses:` of .github/workflows/ names a full commit, a local path or an image digest."""
+
+    def setUp(self):
+        super().setUp()
+        shutil.copytree(SOURCE / ".github" / "workflows", self.root / ".github" / "workflows")
+
+    def workflow(self, steps, name="w.yml"):
+        write(self.root / ".github" / "workflows" / name,
+              "on: pull_request\njobs:\n  t:\n    runs-on: ubuntu-24.04\n    steps:\n" + steps)
+
+    def test_this_repo_workflows_pass(self):
+        self.assertTrue(list((self.root / ".github" / "workflows").glob("*.yml")))
+        self.assertOK()
+
+    def test_unpinned_actions_are_blocked(self):
+        for uses in ("actions/checkout@v7", "actions/checkout@v7.0.1", "actions/checkout@main",
+                     "actions/checkout", f"actions/checkout@{SHA[:7]}", f"actions/checkout@{SHA.upper()}",
+                     f"'actions/checkout@{SHA[:39]}'", "o/r/.github/workflows/ci.yml@main",
+                     "docker://alpine:3.20", "docker://alpine"):
+            with self.subTest(uses=uses):
+                self.workflow(f"      - uses: {uses}\n")
+                self.assertProblem(".github/workflows/w.yml:6")
+
+    def test_unpinned_reusable_workflow_job_is_blocked(self):
+        write(self.root / ".github" / "workflows" / "w.yaml",
+              "on: push\njobs:\n  call:\n    uses: o/r/.github/workflows/ci.yml@v1\n")
+        self.assertProblem(".github/workflows/w.yaml:4")
+
+    def test_local_action_is_checked_too(self):
+        write(self.root / ".github" / "actions" / "local" / "action.yml",
+              "runs:\n  using: composite\n  steps:\n    - uses: actions/cache@v4\n")
+        self.workflow("      - uses: ./.github/actions/local\n")
+        self.assertProblem(".github/actions/local/action.yml:4")
+
+    def test_pinned_neighbours_pass(self):
+        self.workflow(f"      - uses: actions/checkout@{SHA} # v7.0.1\n"
+                      f"      - name: x\n        uses: \"actions/setup-python@{SHA}\"\n"
+                      f"      - uses: o/r/sub/dir@{SHA}\n"
+                      "      - uses: ./.github/actions/local\n"
+                      f"      - uses: docker://alpine@{DIGEST}\n"
+                      "      - run: echo the word uses is fine here\n")
+        self.assertOK()
+
+    def test_not_understood(self):
+        for steps in ("      - uses:\n",
+                      "      - uses: >\n          actions/checkout@v7\n",
+                      "      - uses: ${{ matrix.action }}\n",
+                      f"      - {{ uses: actions/checkout@{SHA} }}\n",
+                      f"      - \"uses\": actions/checkout@{SHA}\n",
+                      "      - run: echo x; uses: y\n"):
+            with self.subTest(steps=steps):
+                self.workflow(steps)
+                self.assertProblem(".github/workflows/w.yml")
+        (self.root / ".github" / "workflows" / "w.yml").write_bytes(b"\xff\xfe uses: x\n")
+        res = self.audit()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
+
 class AgentTools(AuditCase):
     def test_every_agent_lists_its_tools(self):
         for path in sorted((SOURCE / ".claude" / "agents").glob("*.md")):

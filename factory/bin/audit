@@ -15,6 +15,11 @@ or an exact version, never "latest".
 - agents: each skill in `skills:` is vendored in .claude/skills/ (or comes from
   a pinned plugin); `mcpServers:` in an agent isn't checked yet, so it fails.
 - .claude/skills/ entries are real directories, not links out of the repo.
+- .github/**/*.yml|yaml (workflows and local actions): each `uses:` names a full commit
+  (owner/repo[/path]@<40 hex>), a path in the repo (./...) or an image digest
+  (docker://image@sha256:...), never a tag or a branch. Read line by line, not
+  as YAML: a `uses` key in any other form (flow mapping, quoted key, block
+  scalar, expression) isn't understood, so it fails.
 
 Agents: each .claude/agents/*.md lists its tools explicitly; intake has no
 shell; reviewers have no edit tool, and guard.py knows their lens (it reads
@@ -185,6 +190,48 @@ def check_mcp(root):
             problem(where, f"not pinned to an exact version: {' '.join(words)}")
 
 
+USES_KEY = re.compile(r"^\s*(?:-\s+)?uses:(?:\s+(.*?))?\s*$")
+ACTION_AT_SHA = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[^@\s]+)?@[0-9a-f]{40}$")
+
+
+def uses_pinned(value):
+    if value.startswith("./"):
+        return True  # versioned with this repo
+    if value.startswith("docker://"):
+        return bool(DIGEST.search(value))
+    return bool(ACTION_AT_SHA.match(value))
+
+
+def check_workflows(root):
+    folder = root / ".github"
+    if not folder.is_dir():
+        return
+    for path in sorted(folder.rglob("*")):
+        if path.suffix not in (".yml", ".yaml") or not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        try:
+            lines = path.read_text(encoding="utf-8").split("\n")
+        except (OSError, UnicodeDecodeError) as e:
+            problem(rel, f"unreadable ({e})")
+            continue
+        for n, line in enumerate(lines, 1):
+            where = f"{rel}:{n}"
+            text = re.sub(r"\s+#.*$", "", line)
+            m = USES_KEY.match(text)
+            if not m:
+                if re.search(r"\buses[\"']?\s*:", text):
+                    problem(where, f"`uses` not understood: {line.strip()}")
+                continue
+            value = (m.group(1) or "").strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+            if not value or value[0] in "|>" or "${{" in value:
+                problem(where, f"`uses` not understood: {line.strip()}")
+            elif not uses_pinned(value):
+                problem(where, f"action not pinned to a full commit sha: {value}")
+
+
 # ---- Agents ----------------------------------------------------------------------------
 
 def frontmatter(path):
@@ -320,6 +367,7 @@ def main():
             check_settings(where, settings)
     check_mcp(root)
     check_skills_dir(root)
+    check_workflows(root)
     check_agents(root, {"plugins": plugins})
     for p in problems:
         print(f"audit: {p}", file=sys.stderr)
