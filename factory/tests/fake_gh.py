@@ -7,7 +7,9 @@ rewrites after each call. Errors look like gh's: a JSON body on stdout,
 `gh: <message> (HTTP <code>)` on stderr, exit status 1.
 
 State keys: user, next, issues, comments, deps, deps_unavailable, pulls,
-check_runs, statuses, reviews, protection, rules, rules_error.
+check_runs, statuses, reviews, protection, rules, rules_error, permissions
+(the account's rights on the repository; absent means full rights, null
+means the answer carries none), unauthenticated.
 """
 
 import hashlib
@@ -50,12 +52,20 @@ def pull_or_404(state, n):
 
 def route(state, method, path, query, payload):
     user = state["user"]
-    m = re.fullmatch(r"repos/[^/]+/[^/]+/(.*)", path)
+    m = re.fullmatch(r"repos/[^/]+/[^/]+(?:/(.*))?", path)
     if path == "user" and method == "GET":
         return {"login": user}
     if not m:
         raise HttpError(404, "Not Found")
-    rest = m.group(1)
+    rest = m.group(1) or ""
+
+    if rest == "" and method == "GET":
+        repo = {"full_name": "o/r", "default_branch": "main"}
+        perms = state.get("permissions", {"admin": True, "maintain": True, "push": True,
+                                          "triage": True, "pull": True})
+        if perms is not None:
+            repo["permissions"] = perms
+        return repo
 
     if rest == "issues" and method == "GET":
         want_state = query.get("state", "open")
@@ -206,6 +216,9 @@ def main():
     if os.environ.get("FAKE_GH_LOG"):
         with open(os.environ["FAKE_GH_LOG"], "a") as f:
             f.write(json.dumps(args) + "\n")
+    if state.get("unauthenticated"):
+        print("To get started with GitHub CLI, please run:  gh auth login", file=sys.stderr)
+        sys.exit(4)
     if "-R" in args:
         i = args.index("-R")
         args = args[:i] + args[i + 2:]
