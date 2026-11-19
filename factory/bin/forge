@@ -30,6 +30,9 @@ Usage:
   forge mr merge <n> --head SHA [--method merge|squash|rebase]
                                                 merges only if the request's head is SHA
   forge protection <branch>                     protection of a base branch
+  forge labels                                  the repository's labels: name, color, description
+  forge label create NAME [--color RRGGBB] [--description D]   fails if NAME exists
+  forge label delete NAME
 
 Blockers are the forge's native « blocked by » relation, plus the written
 convention « Bloqué par #n » in the ticket body (the fallback where the
@@ -94,6 +97,9 @@ class Forge:
     def mr_status(self, number): raise NotImplementedError
     def mr_merge(self, number, head, method): raise NotImplementedError
     def protection(self, branch): raise NotImplementedError
+    def labels(self): raise NotImplementedError
+    def label_create(self, name, color, description): raise NotImplementedError
+    def label_delete(self, name): raise NotImplementedError
 
 
 class GhError(ForgeError):
@@ -366,6 +372,29 @@ class GitHub(Forge):
         return out
 
 
+    # ---- repository labels ----
+
+    def labels(self):
+        return [{"name": l["name"], "color": l.get("color", ""), "description": l.get("description") or ""}
+                for l in self.api("GET", "labels?per_page=100", paginate=True)]
+
+    def label_create(self, name, color, description):
+        try:
+            self.api("POST", "labels", {"name": name, "color": color, "description": description})
+        except GhError as e:
+            if e.status == 422 and "already_exists" in str(e):
+                raise ForgeError(f"le label « {name} » existe déjà")
+            raise
+
+    def label_delete(self, name):
+        try:
+            self.api("DELETE", f"labels/{quote(name, safe='')}")
+        except GhError as e:
+            if e.status == 404:
+                raise ForgeError(f"label « {name} » introuvable")
+            raise
+
+
 ADAPTERS = {"github": GitHub}
 
 
@@ -394,6 +423,12 @@ def split(values):
     return [v for value in values or [] for v in value.split(",") if v]
 
 
+def colour(value):
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", value):
+        raise argparse.ArgumentTypeError(f"couleur {value!r} : six chiffres hexadécimaux attendus")
+    return value.lower()
+
+
 def parser():
     p = argparse.ArgumentParser(prog="forge", description="Forge-neutral access for the factory.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -406,6 +441,13 @@ def parser():
     s.add_argument("number", type=int)
     s = sub.add_parser("protection")
     s.add_argument("branch")
+    sub.add_parser("labels")
+    lab = sub.add_parser("label").add_subparsers(dest="op", required=True)
+    s = lab.add_parser("create")
+    s.add_argument("name")
+    s.add_argument("--color", default="ededed", type=colour)
+    s.add_argument("--description", default="")
+    lab.add_parser("delete").add_argument("name")
 
     def body(s):
         g = s.add_mutually_exclusive_group()
@@ -466,6 +508,12 @@ def run(args):
         return f.blockers(args.number)
     if args.cmd == "protection":
         return f.protection(args.branch)
+    if args.cmd == "labels":
+        return f.labels()
+    if args.cmd == "label":
+        if args.op == "create":
+            return f.label_create(args.name, args.color, args.description)
+        return f.label_delete(args.name)
     if args.cmd == "ticket":
         if args.op == "view":
             return f.ticket_view(args.number, split(args.allow))
@@ -489,7 +537,7 @@ def run(args):
 
 
 NO_OUTPUT = {("ticket", "comment"), ("ticket", "label"), ("mr", "edit"), ("mr", "ready"),
-             ("mr", "comment"), ("mr", "close")}
+             ("mr", "comment"), ("mr", "close"), ("label", "create"), ("label", "delete")}
 
 
 def main():

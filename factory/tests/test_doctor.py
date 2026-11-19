@@ -279,6 +279,24 @@ class BaseBranch(DoctorCase):
         self.git(self.root, "remote", "remove", "origin")
         self.fails("origin")
 
+    # `--base` names the base of the repository under diagnosis (factory install
+    # runs this doctor on a target whose base comes from its answers, not this config).
+    def test_base_option_overrides_the_config(self):
+        self.git(self.root, "branch", "trunk")
+        res = self.bin("doctor", "--base", "trunk", stdin="")
+        self.assertEqual(res.returncode, 1, res.stdout)
+        self.assertIn("trunk n'existe pas sur origin", res.stdout)
+        self.git(self.root, "push", "-q", "origin", "trunk")
+        res = self.bin("doctor", "--base", "trunk", stdin="")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("trunk à jour", res.stdout)
+
+    def test_empty_base_option_fails(self):
+        res = self.bin("doctor", "--base", "", stdin="")
+        self.assertEqual(res.returncode, 1, res.stdout)
+        self.assertIn("base_branch", res.stdout)
+        self.assertEqual(self.checked_models(), [])
+
 
 class Prices(DoctorCase):
     def commit_config(self):

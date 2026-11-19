@@ -18,6 +18,7 @@ Ce fichier est une table des matières. La référence fait foi.
 - `factory/bin/gate`, `factory/bin/route` — gate déterministe et routage des reviewers.
 - `factory/checks.sh` — contrôles du dépôt cible ; modèle vide à configurer.
 - `.claude/settings.json`, `.claude/hooks/guard.py` — règles de refus des secrets et hook PreToolUse qui bloque les commandes destructrices (§8).
+- `factory/bin/factory` — point d'entrée : `doctor`, `discover`, `install`, `uninstall`, `audit`. L'installeur (`factory/bin/installer`) pose la factory sur un dépôt neuf, d'après `factory/answers.json`, et tient son journal `factory/install-log.json`.
 - `factory/bin/audit` — vérifie l'épinglage des skills, plugins et serveurs MCP, et les outils des agents.
 - `factory/config.json` — politique : `auto_merge: never`, `concurrency: 1` (palier 1).
 - `.claude/agents/`, `.claude/skills/factory/` — agents et orchestrateur.
