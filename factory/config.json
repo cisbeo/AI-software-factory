@@ -28,11 +28,13 @@
     "factory/config.json",
     "factory/bin/*",
     ".claude/*",
+    ".github/workflows/*",
     "AGENTS.md",
     "CLAUDE.md"
   ],
   "protected_trees": [
     ".claude/*",
+    ".github/workflows/*",
     "factory/bin/*",
     "agents.md",
     "*/agents.md",

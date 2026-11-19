@@ -1,0 +1,40 @@
+# Suite de la factory, obligatoire sur main (décision #5, ticket #29).
+# `pull_request` seulement, jamais `pull_request_target` : le code d'une branche
+# tourne sans les droits du dépôt. Actions épinglées à un commit complet ;
+# `factory/bin/audit` échoue sinon.
+name: factory-tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: factory-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    name: suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Plancher de factory/bin/doctor (MINIMUM["python3"] = 3.9.0). 3.9.0 n'est
+      # pas publié pour ubuntu-24.04 par actions/python-versions : on prend la
+      # dernière 3.9.x, même version mineure que le plancher.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.9"
+      - name: Versions
+        run: python3 --version && git --version
+      - name: Suite
+        run: python3 -B -m unittest discover -s factory/tests
+      - name: Mutations
+        run: python3 -B factory/tests/mutations.py

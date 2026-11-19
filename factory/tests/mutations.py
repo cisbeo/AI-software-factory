@@ -72,6 +72,7 @@ MUTATIONS = [
  ("guard: agent_type ignoré", ".claude/hooks/guard.py", 'if lens is None and agent and agent.startswith("reviewer-"):', 'if False:', "test_securite_hook.ReviewerReadOnly"),
  ("audit: reviewer inconnu du hook accepté", "factory/bin/audit", 'if lens not in guard_lenses_:', 'if False:', "test_securite_audit.AgentTools"),
  ("audit: reviewer qui peut éditer", "factory/bin/audit", 'if EDIT_TOOLS & set(tools):', 'if False:', "test_securite_audit.AgentTools"),
+ ("audit: action de workflow non épinglée acceptée", "factory/bin/audit", 'return bool(ACTION_AT_SHA.match(value))', 'return True', "test_securite_audit.WorkflowPins"),
  ("audit: règle de refus manquante acceptée", "factory/bin/audit", 'if rule not in deny:', 'if False:', "test_securite_audit.SettingsAudit"),
  ('installer: --dry-run écrit quand même', 'factory/bin/installer', 'if args.dry_run:\n        say("INSTALL: OK (à blanc', 'if False:\n        say("INSTALL: OK (à blanc', 'test_install.DryRun test_install.Overwrite.test_dry_run_asks_no_consent'),
  ('installer: doctor sauté', 'factory/bin/installer', '    run_doctor(target, early', '    (lambda *a: None)(target, early', 'test_install.DryRun'),

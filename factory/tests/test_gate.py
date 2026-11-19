@@ -105,6 +105,11 @@ class ProtectedPaths(GateCase):
         self.assert_verdict(self.gate(), "FAIL")
         self.assertIn("A .claude/agents/rogue.md", self.checks_md())
 
+    def test_workflow_added_or_modified_fails(self):
+        self.commit_on_branch({".github/workflows/rogue.yml": "on: push\n"})
+        self.assert_verdict(self.gate(), "FAIL")
+        self.assertIn("A .github/workflows/rogue.yml", self.checks_md())
+
     def test_case_variant_of_protected_path_fails(self):
         # macOS folds `Agents.md` onto `AGENTS.md`; git sees a different path.
         self.commit_on_branch({"docs/Agents.md": "sneaky\n"})
