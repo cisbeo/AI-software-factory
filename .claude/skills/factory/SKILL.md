@@ -169,6 +169,9 @@ then moves the job to `merged`; stop any agents still running for it.
 
 ## /factory run
 
+0. Run `factory/bin/doctor` first. On `DOCTOR: FAIL`, start nothing: show the
+   user its `FAIL` line and its `Correction :` line, and stop. `warn` lines
+   don't stop the run; repeat them to the user.
 1. Run `factory/bin/job queue`. Each line is `action  issue  job  stage  note`:
    `resume` (pick it up from its stage), `new` (no job yet), `hold` (no free
    slot, or the merge requests waiting for a human reached
@@ -203,7 +206,7 @@ as `resume`: run `factory/bin/job advance <id> intake` and go to **intake**.
 
 ## /factory run <n>
 
-Run one issue with the same steps. If `factory/bin/job queue` shows a job for
+Run one issue with the same steps, `factory/bin/doctor` first. If `factory/bin/job queue` shows a job for
 it, resume that job; otherwise `factory/bin/job create <n>`, which refuses an
 issue that has an unmerged blocker, or while the merge requests waiting for a
 human reach `max_waiting_for_human`: show the user its refusal verbatim and

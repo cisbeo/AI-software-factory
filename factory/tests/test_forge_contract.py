@@ -165,6 +165,12 @@ class FakeWorld:
         self.edit(lambda s: s["reviews"].setdefault(str(n), []).append(
             {"user": {"login": author}, "state": state, "commit_id": sha}))
 
+    def grant(self, permissions):
+        self.edit(lambda s: s.update(permissions=permissions))
+
+    def log_out(self):
+        self.edit(lambda s: s.update(unauthenticated=True))
+
     def protect(self, branch, protection):
         self.edit(lambda s: s["protection"].update({branch: protection}))
 
@@ -316,6 +322,46 @@ class ForgeContract(unittest.TestCase):
 
     def test_whoami_gives_the_operator_login(self):
         self.assertEqual(self.forge_json("whoami"), {"login": self.world.user})
+
+    def test_whoami_without_authentication_says_how_to_log_in(self):
+        if self.world.live:
+            self.skipTest("can't log out a live account")
+        self.world.log_out()
+        res = self.forge_fails("whoami")
+        self.assertIn("gh auth login", res.stderr)
+
+    # ---- permissions --------------------------------------------------------
+
+    def test_permissions_of_a_writer(self):
+        if self.world.live:
+            self.assertEqual(set(self.forge_json("permissions")), {"push", "label", "merge"})
+            return
+        self.world.grant({"admin": False, "maintain": False, "push": True, "triage": True, "pull": True})
+        self.assertEqual(self.forge_json("permissions"), {"push": True, "label": True, "merge": True})
+
+    def test_permissions_of_a_reader(self):
+        if self.world.live:
+            self.skipTest("depends on the live account's rights")
+        self.world.grant({"admin": False, "maintain": False, "push": False, "triage": False, "pull": True})
+        self.assertEqual(self.forge_json("permissions"), {"push": False, "label": False, "merge": False})
+
+    def test_permissions_of_a_triager_can_only_label(self):
+        if self.world.live:
+            self.skipTest("depends on the live account's rights")
+        self.world.grant({"admin": False, "maintain": False, "push": False, "triage": True, "pull": True})
+        self.assertEqual(self.forge_json("permissions"), {"push": False, "label": True, "merge": False})
+
+    def test_permissions_missing_from_the_answer_fail_closed(self):
+        if self.world.live:
+            self.skipTest("can't strip a live answer")
+        self.world.grant(None)
+        self.forge_fails("permissions")
+
+    def test_permissions_that_are_not_booleans_fail_closed(self):
+        if self.world.live:
+            self.skipTest("can't alter a live answer")
+        self.world.grant({"push": "yes", "triage": True})
+        self.forge_fails("permissions")
 
     # ---- tickets and blockers ----------------------------------------------
 
