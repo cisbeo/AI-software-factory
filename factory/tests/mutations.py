@@ -36,6 +36,8 @@ MUTATIONS = [
  ("guard: erreur interne laisse passer", ".claude/hooks/guard.py", '({type(e).__name__}: {e})", file=sys.stderr)\n        return 2', '({type(e).__name__}: {e})", file=sys.stderr)\n        return 1', "test_securite_hook.NotUnderstood"),
  ("guard: reviewer peut tout lancer", ".claude/hooks/guard.py", 'require(prog in READ_PROGRAMS or', 'require(True or', "test_securite_hook.ReviewerReadOnly"),
  ("guard: reviewer écrit n'importe où", ".claude/hooks/guard.py", 'and p[4] == f"review-{lens}.md",', 'and True,', "test_securite_hook.ReviewerReadOnly"),
+ ("guard: variables d'environnement d'un reviewer acceptées", ".claude/hooks/guard.py", 'require(not prefix, f"read-only reviewer', 'require(True, f"read-only reviewer', "test_securite_hook.ReviewerReadOnly"),
+ ("guard: GIT_DIR accepté", ".claude/hooks/guard.py", '        for w in prefix:\n            require(not GIT_REDIRECT.match(w),', '        for w in prefix:\n            require(True,', "test_securite_hook.PushOtherBranch"),
  ("audit: marketplace non épinglée acceptée", "factory/bin/audit", 'return isinstance(ref, str) and bool(SHA.match(ref) or VERSION.match(ref))', 'return True', "test_securite_audit.Pins"),
  ("audit: paquet MCP sans version accepté", "factory/bin/audit", 'ok = spec is not None and npm_spec_pinned(spec)', 'ok = True', "test_securite_audit.Pins"),
  ("audit: skill non vendorisée acceptée", "factory/bin/audit", 'elif not (root / ".claude" / "skills" / skill / "SKILL.md").is_file():', 'elif False:', "test_securite_audit.Pins"),

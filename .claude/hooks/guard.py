@@ -50,6 +50,9 @@ INTERFACE_LENSES = {"ui", "ux"}
 
 SEPARATORS = {";", ";;", "&", "&&", "|", "||", "|&", "(", ")"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Variables that point git at another repository, work tree or config: the push and
+# history checks could no longer tell what the command acts on.
+GIT_REDIRECT = re.compile(r"^(?:export\s+)?(GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_INDEX_FILE|GIT_NAMESPACE|GIT_CONFIG\w*)=")
 HEREDOC = re.compile(r"(?<!<)<<-?(?!<)\s*(['\"]?)([\w.-]+)\1")
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
 WRAPPERS = {"command", "builtin", "exec", "nohup", "time", "caffeinate", "env", "nice", "timeout", "sudo"}
@@ -260,7 +263,8 @@ def check_reviewer_command(words, redirects, lens):
         _, opts, sub, rest = split_git(words, Path("."))
         require(not {"-c", "--git-dir", "--work-tree", "--exec-path"} & set(opts), no)
         require(sub in READ_GIT, no)
-        require(not any(a.startswith(("--output", "--open-files-in-pager")) or a == "-O" for a in rest), no)
+        require(not any(a.startswith(("--output", "--open-files-in-pager", "--ext-diff", "--textconv"))
+                        or a == "-O" for a in rest), no)
         if sub == "branch":
             require(all(a in READ_BRANCH_ARGS for a in rest), no)
     elif prog == "find":
@@ -329,6 +333,8 @@ def segments(tokens):
 
 
 def unwrap(words):
+    """Strip `VAR=x`, env, sudo, nohup... Returns the command, whether sudo was used,
+    and the stripped prefix."""
     i, sudo = 0, False
     while i < len(words):
         name = os.path.basename(words[i])
@@ -343,7 +349,7 @@ def unwrap(words):
                 i += 1  # the duration
         else:
             break
-    return words[i:], sudo
+    return words[i:], sudo, words[:i]
 
 
 def message_args(prog, sub, args):
@@ -362,7 +368,16 @@ def check_command(command, cwd, ctx, depth=0):
         for w in words:
             if "$(" in w:
                 check_command(w.split("$(", 1)[1].rstrip(")"), cwd, ctx, depth + 1)
-        words, sudo = unwrap(words)
+        if words and os.path.basename(words[0]) == "export":
+            for w in words[1:]:
+                require(not GIT_REDIRECT.match(w), f"{w.split('=')[0]} points git elsewhere; blocked")
+        words, sudo, prefix = unwrap(words)
+        for w in prefix:
+            require(not GIT_REDIRECT.match(w), f"{w.split('=')[0]} points git elsewhere; blocked")
+        if ctx["lens"]:
+            # GIT_PAGER=sh, GIT_EXTERNAL_DIFF=..., env, nohup: ways to run something else.
+            require(not prefix, f"read-only reviewer ({ctx['lens']}) may not set variables or use wrappers: "
+                                f"{' '.join(prefix)}")
         if not words:
             for _, target in redirects:
                 require(not secret_in_word(target), f"secret file in the command: {target}; blocked (spec §8)")

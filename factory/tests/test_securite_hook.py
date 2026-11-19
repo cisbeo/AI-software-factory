@@ -154,6 +154,13 @@ class PushOtherBranch(GuardCase):
         self.passes(f"cd {self.wt} && git push -u origin {BRANCH}", self.root)
         self.passes(f"git -C {self.wt} push origin HEAD", self.root)
 
+    def test_git_pointed_elsewhere_is_blocked(self):
+        for cmd in (f"GIT_DIR={self.root}/.git git push origin main", f"GIT_WORK_TREE=/tmp git push origin HEAD",
+                    f"env GIT_DIR={self.root}/.git git push", f"export GIT_DIR={self.root}/.git; git push",
+                    "GIT_CONFIG_GLOBAL=/tmp/x git push origin HEAD"):
+            self.blocked(cmd, self.wt, says="points git elsewhere")
+        self.passes(f"GIT_TRACE=1 git push -u origin {BRANCH}", self.wt)
+
     def test_upstream_elsewhere_is_blocked(self):
         # `git push` with no refspec goes where the push config says, not where the name says.
         self.git(self.wt, "config", "push.default", "upstream")
@@ -274,7 +281,9 @@ class ReviewerReadOnly(GuardCase):
                     "echo x > src/app.txt", "cat src/app.txt | tee out.txt", "sed -i s/a/b/ src/app.txt",
                     "rm src/app.txt", "mv a b", "npm run lint -- --fix", "touch x", "git diff --output=x",
                     "git -c core.pager=sh log", "python3 -c 'open(\"x\",\"w\")'", "find . -delete",
-                    "npm run dev"):
+                    "npm run dev", "GIT_PAGER=sh git log", "GIT_EXTERNAL_DIFF=./x git diff",
+                    "env GIT_PAGER=sh git log", "PAGER='sh -c touch' git log", "nohup cat x",
+                    "git diff --ext-diff", "git log -p --textconv", "export GIT_PAGER=sh"):
             with self.subTest(command=cmd):
                 self.assertBlocked(self.bash(cmd, self.wt, "--reviewer", "code"), says="read-only")
 
