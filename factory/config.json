@@ -28,6 +28,7 @@
     "factory/config.json",
     "factory/bin/*",
     ".claude/*",
+    ".github/workflows/*",
     "AGENTS.md",
     "CLAUDE.md"
   ],
