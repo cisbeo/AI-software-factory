@@ -2,8 +2,8 @@
 
 - A ticket starts only once every blocker is finished: closed as done. A
   blocker that is open, or closed as not planned or duplicate, still blocks.
-- No new job while the merge requests waiting for a human (open, not drafts)
-  reach config `max_waiting_for_human`.
+- No new job while the merge requests waiting for a human (open, not drafts,
+  opened by the operator) reach config `max_waiting_for_human`.
 - `job queue` gives the reason on the row (`blocked`, `hold`) that
   /factory run shows.
 
@@ -112,6 +112,16 @@ class ReviewCapacity(AdmissionCase):
         n = self.ticket()
         self.assertEqual([r[0] for r in self.queue() if r[1] == str(n)], ["new"])
         self.assert_created(self.create(n))
+
+    def test_others_merge_requests_do_not_count(self):
+        # On a public repository, anyone can open ready merge requests: they
+        # must not be able to stall the factory.
+        def foreign(state):
+            for k in list(state["pulls"])[:2]:
+                state["pulls"][k]["user"] = {"login": "mallory"}
+        self.waiting(3)
+        self.world.edit(foreign)
+        self.assert_created(self.create(self.ticket()))
 
     def test_running_jobs_resume_at_the_limit(self):
         self.waiting(3)

@@ -777,12 +777,14 @@ def blocked_note(blockers):
 
 def admission_hold():
     """Why no new job may start now, or None (spec §6, Admission): the merge
-    requests waiting for a human (open, not drafts) reached the reviewer's
-    limit, config `max_waiting_for_human`."""
+    requests waiting for a human reached the reviewer's limit, config
+    `max_waiting_for_human`. Counted: open, not drafts, opened by the operator
+    (the factory's own, and the operator's). Others' merge requests don't
+    count: on a public repository anyone could stall the factory with them."""
     limit = CONFIG.get("max_waiting_for_human")
     require(is_number(limit, integer=True) and limit > 0,
             f"config.json: max_waiting_for_human is {limit!r}, expected a positive integer")
-    waiting = [m for m in forge_json("mrs") if not m["draft"]]
+    waiting = [m for m in forge_json("mrs") if not m["draft"] and m["author"] == operator()]
     if len(waiting) < limit:
         return None
     return (f"{len(waiting)} merge requests waiting for a human (limit {limit}): "
