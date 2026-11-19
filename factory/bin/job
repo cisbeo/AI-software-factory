@@ -8,7 +8,9 @@ orchestrator never improvises them.
 
 Usage:
   job queue                      what /factory run should do with each labeled issue
-                                 (an issue with an open blocker is `blocked`, not `new`)
+                                 (an issue with an unfinished blocker is `blocked`, not `new`;
+                                 new issues are `hold` while the merge requests waiting for a
+                                 human reach config `max_waiting_for_human`)
   job create <issue>             new job for an open `factory` issue; prints the job id
   job advance <job> <stage>      move a job to <stage>, or refuse
   job merge <job>                APPROVE → sync with the base branch, gate, merge the PR
@@ -730,8 +732,13 @@ def cmd_create(number):
     except Refused as e:
         die(str(e))
     if blockers:
-        die(f"issue #{number} is blocked by " + ", ".join(f"#{b}" for b in blockers)
-            + ": close them first")
+        die(f"issue #{number} is {blocked_note(blockers)}: merge them first")
+    try:
+        hold = admission_hold()
+    except Refused as e:
+        die(str(e))
+    if hold:
+        die(f"issue #{number} can't start: {hold}")
     try:
         budget = limits()[0]
     except Refused as e:
@@ -758,9 +765,28 @@ def cmd_create(number):
 
 
 def open_blockers(issue):
-    """Numbers of the open tickets that block this one: the forge's « blocked by »
-    relation, or the written « Bloqué par #n » convention (factory/bin/forge)."""
+    """Numbers of the unfinished tickets that block this one: the forge's
+    « blocked by » relation, or the written « Bloqué par #n » convention. A
+    blocker is finished once closed as done (factory/bin/forge)."""
     return forge_json("blockers", issue)
+
+
+def blocked_note(blockers):
+    return "blocked by " + ", ".join(f"#{b}" for b in blockers) + " (not merged)"
+
+
+def admission_hold():
+    """Why no new job may start now, or None (spec §6, Admission): the merge
+    requests waiting for a human (open, not drafts) reached the reviewer's
+    limit, config `max_waiting_for_human`."""
+    limit = CONFIG.get("max_waiting_for_human")
+    require(is_number(limit, integer=True) and limit > 0,
+            f"config.json: max_waiting_for_human is {limit!r}, expected a positive integer")
+    waiting = [m for m in forge_json("mrs") if not m["draft"]]
+    if len(waiting) < limit:
+        return None
+    return (f"{len(waiting)} merge requests waiting for a human (limit {limit}): "
+            + ", ".join(f"#{m['number']}" for m in waiting) + "; review or merge some first")
 
 
 def cmd_queue():
@@ -774,6 +800,7 @@ def cmd_queue():
         if j["stage"] not in TERMINAL and j["pr"] and pr_state(j) == "merged":
             save(advance(sync(j), "merged"))
     issues = forge_json("tickets", "--label", LABELS["queue"])
+    hold = admission_hold()
     open_numbers = {i["number"] for i in issues}
     running_rows, replied_rows, new_rows, other_rows = [], [], [], []
     for issue in sorted(issues, key=lambda i: i["number"]):
@@ -782,7 +809,9 @@ def cmd_queue():
         if not j:
             blockers = issue["blockers"]
             if blockers:
-                other_rows.append(("blocked", n, "-", "-", "blocked by " + ", ".join(f"#{b}" for b in blockers)))
+                other_rows.append(("blocked", n, "-", "-", blocked_note(blockers)))
+            elif hold:
+                other_rows.append(("hold", n, "-", "-", hold))
             else:
                 new_rows.append(("new", n, "-", "-", issue["title"]))
         elif j["stage"] == "needs-info":

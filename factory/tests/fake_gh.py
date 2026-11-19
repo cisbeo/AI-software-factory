@@ -7,7 +7,7 @@ rewrites after each call. Errors look like gh's: a JSON body on stdout,
 `gh: <message> (HTTP <code>)` on stderr, exit status 1.
 
 State keys: user, next, issues, comments, deps, deps_unavailable, pulls,
-check_runs, statuses, reviews, protection, rules, rules_error.
+check_runs, statuses, reviews, protection, rules, rules_error, pulls_error.
 """
 
 import hashlib
@@ -117,6 +117,8 @@ def route(state, method, path, query, payload):
             return [state["issues"][str(b)] for b in state["deps"].get(mm.group(1), [])]
 
     if rest == "pulls" and method == "GET":
+        if state.get("pulls_error"):
+            raise HttpError(state["pulls_error"], "Bad Gateway")
         head = query.get("head", "").split(":")[-1]
         want_state = query.get("state", "open")
         return [p for p in state["pulls"].values()
