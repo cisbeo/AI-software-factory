@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Check the factory's own security setup (spec §8). Exit 1 on any problem.
+
+Usage: factory/bin/audit [--root DIR]      (default: this checkout)
+
+Pins: every skill, plugin and MCP server the repo uses is pinned to a commit
+or an exact version, never "latest".
+- .claude/settings.json (and settings.local.json): each extraKnownMarketplaces
+  source is a directory inside the repo, or a git/github source with `sha`
+  (40 hex) or `ref` set to a full commit or an exact version (v1.2.3);
+  each enabledPlugins entry comes from one of those marketplaces.
+- .mcp.json: stdio servers launched through npx, bunx, pnpm dlx, npm exec,
+  uvx, pipx or docker name an exact version (pkg@1.2.3, pkg==1.2.3, image@sha256);
+  remote servers (url, http, sse, ws) can't be pinned and fail.
+- agents: each skill in `skills:` is vendored in .claude/skills/ (or comes from
+  a pinned plugin); `mcpServers:` in an agent isn't checked yet, so it fails.
+- .claude/skills/ entries are real directories, not links out of the repo.
+
+Agents: each .claude/agents/*.md lists its tools explicitly; intake has no
+shell; reviewers have no edit tool, and guard.py knows their lens (it reads
+`agent_type` and holds reviewer-<lens> to read-only).
+
+Settings: deny rules for secret files on Read and Edit, and guard.py as a
+PreToolUse hook on Bash and the file tools.
+
+Anything it can't parse is a problem: fail closed.
+"""
+
+import argparse
+import json
+import re
+import shlex
+import sys
+from pathlib import Path
+
+SHA = re.compile(r"^[0-9a-f]{40}$")
+VERSION = re.compile(r"^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
+KNOWN_TOOLS = {"Read", "Grep", "Glob", "Bash", "Edit", "Write", "MultiEdit", "NotebookEdit",
+               "WebFetch", "WebSearch", "Skill", "TodoWrite"}
+EDIT_TOOLS = {"Edit", "MultiEdit", "NotebookEdit"}
+GUARDED_TOOLS = {"Bash", "Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "Grep", "Glob"}
+SECRET_PATTERNS = (".env*", "*.pem", "*.key", "*.p8", "*.p12", "*.pfx", "*.jks", "*.keystore",
+                   "*.crt", "*.cer", "*.der", "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*")
+GUARD = ".claude/hooks/guard.py"
+
+problems = []
+
+
+def problem(where, what):
+    problems.append(f"{where}: {what}")
+
+
+def load_json(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        problem(path.name, f"unreadable JSON ({e})")
+        return None
+
+
+# ---- Pins ---------------------------------------------------------------------------
+
+def pinned_ref(src):
+    sha, ref = src.get("sha"), src.get("ref")
+    if sha is not None:
+        return isinstance(sha, str) and bool(SHA.match(sha))
+    return isinstance(ref, str) and bool(SHA.match(ref) or VERSION.match(ref))
+
+
+def check_marketplaces(root, where, settings):
+    pinned = set()
+    markets = settings.get("extraKnownMarketplaces", {})
+    if not isinstance(markets, dict):
+        problem(where, "extraKnownMarketplaces isn't an object")
+        return pinned
+    for name, entry in markets.items():
+        src = entry.get("source") if isinstance(entry, dict) else None
+        kind = src.get("source") if isinstance(src, dict) else None
+        if kind in ("github", "git"):
+            if pinned_ref(src):
+                pinned.add(name)
+            else:
+                problem(where, f"marketplace {name} isn't pinned: set `sha` (40 hex) or `ref` to a commit or exact version, "
+                               f"not {src.get('ref') or src.get('sha') or 'latest'!r}")
+        elif kind in ("directory", "file"):
+            path = src.get("path")
+            if isinstance(path, str) and not Path(path).is_absolute() and ".." not in Path(path).parts:
+                pinned.add(name)  # versioned with this repo
+            else:
+                problem(where, f"marketplace {name}: a path outside the repo isn't pinned ({path!r})")
+        else:
+            problem(where, f"marketplace {name}: source {kind!r} can't be pinned or isn't understood")
+    return pinned
+
+
+def check_plugins(where, settings, pinned):
+    plugins = settings.get("enabledPlugins", {})
+    if not isinstance(plugins, dict):
+        problem(where, "enabledPlugins isn't an object")
+        return set()
+    enabled = set()
+    for key, on in plugins.items():
+        if not on:
+            continue
+        name, at, market = key.partition("@")
+        if not at or not name or not market:
+            problem(where, f"plugin {key!r} isn't <plugin>@<marketplace>")
+        elif market not in pinned:
+            problem(where, f"plugin {key} comes from marketplace {market}, which this repo doesn't pin")
+        else:
+            enabled.add(name)
+    return enabled
+
+
+def package_args(args, value_opts):
+    out, i = [], 0
+    while i < len(args):
+        if args[i] in value_opts:
+            i += 2
+            continue
+        if not args[i].startswith("-"):
+            out.append(args[i])
+        i += 1
+    return out
+
+
+def npm_spec_pinned(spec):
+    name, _, version = spec[1:].partition("@") if spec.startswith("@") else spec.partition("@")
+    return bool(version) and bool(VERSION.match(version))
+
+
+def py_spec_pinned(spec):
+    m = re.match(r"^[A-Za-z0-9_.\[\],-]+(?:==|@)(.+)$", spec)
+    return bool(m and VERSION.match(m.group(1)))
+
+
+def check_mcp(root):
+    path = root / ".mcp.json"
+    if not path.exists():
+        return
+    data = load_json(path)
+    if data is None:
+        return
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict):
+        problem(".mcp.json", "mcpServers isn't an object")
+        return
+    for name, s in servers.items():
+        where = f".mcp.json {name}"
+        if not isinstance(s, dict):
+            problem(where, "server entry isn't an object")
+            continue
+        if s.get("url") is not None or s.get("type") in ("http", "streamable-http", "sse", "ws"):
+            problem(where, "remote server: its version can't be pinned")
+            continue
+        command, args = s.get("command"), s.get("args", [])
+        if not isinstance(command, str) or not command or not isinstance(args, list) \
+                or not all(isinstance(a, str) for a in args):
+            problem(where, "command/args not understood")
+            continue
+        words = shlex.split(command) + args
+        prog = Path(words[0]).name
+        rest = words[1:]
+        if prog in ("pnpm", "yarn") and rest[:1] == ["dlx"] or prog == "npm" and rest[:1] == ["exec"]:
+            prog, rest = "npx", rest[1:]
+        if prog == "uv" and rest[:2] == ["tool", "run"]:
+            prog, rest = "uvx", rest[2:]
+        if prog in ("npx", "bunx", "pnpx"):
+            pkgs = package_args(rest, {"-p", "--package", "-c", "--call"})
+            explicit = [rest[i + 1] for i, a in enumerate(rest[:-1]) if a in ("-p", "--package")]
+            spec = explicit[0] if explicit else (pkgs[0] if pkgs else None)
+            ok = spec is not None and npm_spec_pinned(spec)
+        elif prog in ("uvx", "pipx"):
+            rest = rest[1:] if prog == "pipx" and rest[:1] == ["run"] else rest
+            frm = [rest[i + 1] for i, a in enumerate(rest[:-1]) if a in ("--from", "--spec")]
+            pkgs = package_args(rest, {"--from", "--spec", "--with", "--python", "-p"})
+            spec = frm[0] if frm else (pkgs[0] if pkgs else None)
+            ok = spec is not None and py_spec_pinned(spec)
+        elif prog in ("docker", "podman"):
+            ok = any(DIGEST.search(a) for a in rest)
+        else:
+            ok = not any(re.match(r"^(https?|git\+\w+|git)://", a) for a in words)
+        if not ok:
+            problem(where, f"not pinned to an exact version: {' '.join(words)}")
+
+
+# ---- Agents ----------------------------------------------------------------------------
+
+def frontmatter(path):
+    text = path.read_text()
+    m = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+    if not m:
+        return None
+    fields, key = {}, None
+    for line in m.group(1).split("\n"):
+        top = re.match(r"^([A-Za-z][\w-]*):\s*(.*)$", line)
+        if top:
+            key = top.group(1)
+            fields[key] = top.group(2).strip()
+        elif key and line.strip():
+            fields[key] += "\n" + line
+        elif line.strip():
+            return None
+    return fields
+
+
+def as_list(value):
+    items = []
+    for line in value.split("\n"):
+        line = line.strip()
+        if line.startswith("- "):
+            items.append(line[2:].strip())
+        elif line:
+            items += [t.strip() for t in line.split(",") if t.strip()]
+    return items
+
+
+def guard_lenses(root):
+    try:
+        m = re.search(r"^LENSES = \{(.*)\}$", (root / GUARD).read_text(), re.M)
+    except OSError:
+        m = None
+    if not m:
+        problem(GUARD, "missing, or its LENSES line isn't understood")
+        return set()
+    return set(re.findall(r'"([\w-]+)"', m.group(1)))
+
+
+def check_agents(root, skills_ok):
+    guard_lenses_ = guard_lenses(root)
+    agents = sorted((root / ".claude" / "agents").glob("*.md"))
+    for path in agents:
+        where = f".claude/agents/{path.name}"
+        fm = frontmatter(path)
+        if fm is None:
+            problem(where, "frontmatter not understood")
+            continue
+        name = fm.get("name", "")
+        tools = as_list(fm.get("tools", ""))
+        if not tools:
+            problem(where, "no explicit tools list (an agent without one inherits every tool)")
+        unknown = [t for t in tools if t not in KNOWN_TOOLS]
+        if unknown:
+            problem(where, f"tools not understood: {', '.join(unknown)}")
+        if name == "intake" and {"Bash"} & set(tools):
+            problem(where, "intake reads the ticket text first: it must not have a shell (spec §8)")
+        if name.startswith("reviewer-"):
+            lens = name[len("reviewer-"):]
+            if EDIT_TOOLS & set(tools):
+                problem(where, f"a reviewer is read-only: drop {', '.join(sorted(EDIT_TOOLS & set(tools)))}")
+            if lens not in guard_lenses_:
+                problem(where, f"{GUARD} has no read-only rules for {name}: add {lens!r} to its LENSES")
+        if "mcpServers" in fm:
+            problem(where, "mcpServers in an agent isn't checked for pins yet")
+        for skill in as_list(fm.get("skills", "")):
+            plugin, colon, _ = skill.partition(":")
+            if colon:
+                if plugin not in skills_ok["plugins"]:
+                    problem(where, f"skill {skill} comes from plugin {plugin}, which this repo doesn't pin")
+            elif not (root / ".claude" / "skills" / skill / "SKILL.md").is_file():
+                problem(where, f"skill {skill} isn't vendored in .claude/skills/, so its version isn't pinned")
+
+
+def check_skills_dir(root):
+    skills = root / ".claude" / "skills"
+    if not skills.is_dir():
+        return
+    for entry in sorted(skills.iterdir()):
+        if entry.is_symlink():
+            problem(f".claude/skills/{entry.name}", "a link: its target isn't versioned with the repo")
+
+
+# ---- Settings ----------------------------------------------------------------------------
+
+def check_settings(where, settings):
+    deny = settings.get("permissions", {}).get("deny", [])
+    if not isinstance(deny, list) or not all(isinstance(r, str) for r in deny):
+        problem(where, "permissions.deny isn't a list of rules")
+        return
+    for tool in ("Read", "Edit"):
+        for pat in SECRET_PATTERNS:
+            for rule in (f"{tool}(**/{pat})", f"{tool}(//**/{pat})"):
+                if rule not in deny:
+                    problem(where, f"missing deny rule {rule}")
+    entries = settings.get("hooks", {}).get("PreToolUse", [])
+    covered = set()
+    for entry in entries if isinstance(entries, list) else []:
+        for h in entry.get("hooks", []) if isinstance(entry, dict) else []:
+            cmd = h.get("command", "") if isinstance(h, dict) else ""
+            if h.get("type") == "command" and re.search(rf"{re.escape(GUARD)}[\"']?$", cmd.strip()):
+                covered |= set(str(entry.get("matcher", "")).split("|"))
+    missing = GUARDED_TOOLS - covered
+    if missing:
+        problem(where, f"{GUARD} isn't a PreToolUse hook for {', '.join(sorted(missing))}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
+    root = ap.parse_args().root.resolve()
+
+    plugins = set()
+    main_settings = root / ".claude" / "settings.json"
+    if not main_settings.exists():
+        problem(".claude/settings.json", "missing: no deny rules, no hook")
+    for name in ("settings.json", "settings.local.json"):
+        path = root / ".claude" / name
+        if not path.exists():
+            continue
+        settings = load_json(path)
+        if not isinstance(settings, dict):
+            if settings is not None:
+                problem(name, "not a JSON object")
+            continue
+        where = f".claude/{name}"
+        pinned = check_marketplaces(root, where, settings)
+        plugins |= check_plugins(where, settings, pinned)
+        if name == "settings.json":
+            check_settings(where, settings)
+    check_mcp(root)
+    check_skills_dir(root)
+    check_agents(root, {"plugins": plugins})
+    for p in problems:
+        print(f"audit: {p}", file=sys.stderr)
+    if problems:
+        sys.exit(1)
+    print("audit: OK")
+
+
+if __name__ == "__main__":
+    main()
