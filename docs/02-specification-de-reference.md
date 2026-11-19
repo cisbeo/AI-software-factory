@@ -280,7 +280,7 @@ Aucun script ni agent n'appelle `gh` ou `glab` directement : ils passent par une
 | --- | --- | --- |
 | Ligne de commande | `gh` | `glab` |
 | Dépendances entre tickets | Relation « bloqué par » | Relation de blocage réservée aux offres Premium et Ultimate ([documentation](https://docs.gitlab.com/user/work_items/linked_items/)) ; sinon convention « Bloqué par #n » dans le ticket |
-| Fusion liée à un commit | `gh pr merge --match-head-commit` (à vérifier) | `glab mr merge --sha` ([documentation](https://docs.gitlab.com/cli/mr/merge/)) |
+| Fusion liée à un commit | `gh pr merge --match-head-commit` (vérifié, gh 2.104.0) ; l’adaptateur utilise son équivalent REST, le paramètre `sha` de `PUT /pulls/{n}/merge` | `glab mr merge --sha` ([documentation](https://docs.gitlab.com/cli/mr/merge/)) |
 | CI | GitHub Actions | GitLab CI |
 | Instance | github.com | gitlab.com ou auto-hébergée : l'adresse est un paramètre |
 | Sessions cloud de Claude Code et `/autofix-pr` | Disponibles | Indisponibles : elles exigent GitHub ([documentation](https://code.claude.com/docs/en/claude-code-on-the-web#limitations)) |

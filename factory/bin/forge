@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""The factory's only door to the forge (spec §10, ADR 0005).
+
+Scripts and agents never call `gh` or `glab` themselves: they call this
+command, whose interface is the same on every forge. Its output is JSON in
+neutral words: « ticket » for an issue, « mr » (demande de fusion) for a pull
+request or merge request. Errors go to stderr as `forge: <message>`, exit 1;
+usage errors exit 2.
+
+Usage:
+  forge whoami                                  {"login"}
+  forge tickets --label L                       open tickets carrying L, with their open blockers
+  forge blockers <n>                            open tickets blocking <n>
+  forge ticket view <n> [--allow LOGIN]...      ticket, with only the comments of its author,
+                                                of the operator and of each --allow login
+  forge ticket create --title T [--body B | --body-file F] [--label L]...
+  forge ticket comment <n> [--body B | --body-file F]   (body from stdin otherwise)
+  forge ticket label <n> [--add L]... [--remove L]...   (L may be comma-separated)
+  forge mr find --head BRANCH                   open merge request from BRANCH, or null
+  forge mr create --head B --base B --title T [--body B | --body-file F]   always a draft
+  forge mr edit <n> [--title T] [--body B | --body-file F]
+  forge mr view <n>                             state open|closed|merged, draft, head, head_sha, base, body
+  forge mr ready <n>                            draft → ready for review
+  forge mr comment <n> [--body B | --body-file F]
+  forge mr close <n>
+  forge mr status <n>                           checks (pass|fail|pending|skipped), approvals given on
+                                                the current head, stale approvals, changes requested
+  forge mr merge <n> --head SHA [--method merge|squash|rebase]
+                                                merges only if the request's head is SHA
+  forge protection <branch>                     protection of a base branch
+
+Blockers are the forge's native « blocked by » relation, plus the written
+convention « Bloqué par #n » in the ticket body (the fallback where the
+relation doesn't exist). A native relation that exists but can't be read
+is an error. A written blocker that can't be read counts as open: waiting costs nothing, starting a blocked ticket costs a job.
+
+Environment: FORGE picks the adapter (default: `forge` in factory/config.json,
+else github). FORGE_REPO=owner/name targets another repository than the
+current checkout's.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import quote
+
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
+MERGE_METHODS = ("merge", "squash", "rebase")
+WRITTEN_BLOCKER = re.compile(r"^\s*bloqu[ée] par\s*:?\s*((?:#\d+[\s,et]*)+)", re.I | re.M)
+
+
+class ForgeError(Exception):
+    pass
+
+
+def written_blockers(body):
+    """Ticket numbers named on « Bloqué par #n[, #m] » lines of a ticket body."""
+    found = set()
+    for m in WRITTEN_BLOCKER.finditer(body or ""):
+        found |= {int(n) for n in re.findall(r"#(\d+)", m.group(1))}
+    return found
+
+
+class Forge:
+    """The interface every adapter implements. Numbers are the forge's
+    per-repository ticket and merge request numbers."""
+
+    def whoami(self): raise NotImplementedError
+    def tickets(self, label): raise NotImplementedError
+    def blockers(self, number): raise NotImplementedError
+    def ticket_view(self, number, allow=()): raise NotImplementedError
+    def ticket_create(self, title, body, labels): raise NotImplementedError
+    def ticket_comment(self, number, body): raise NotImplementedError
+    def ticket_label(self, number, add=(), remove=()): raise NotImplementedError
+    def mr_find(self, head): raise NotImplementedError
+    def mr_create(self, head, base, title, body): raise NotImplementedError
+    def mr_edit(self, number, title=None, body=None): raise NotImplementedError
+    def mr_view(self, number): raise NotImplementedError
+    def mr_ready(self, number): raise NotImplementedError
+    def mr_comment(self, number, body): raise NotImplementedError
+    def mr_close(self, number): raise NotImplementedError
+    def mr_status(self, number): raise NotImplementedError
+    def mr_merge(self, number, head, method): raise NotImplementedError
+    def protection(self, branch): raise NotImplementedError
+
+
+class GhError(ForgeError):
+    def __init__(self, message, status):
+        super().__init__(message)
+        self.status = status
+
+
+class GitHub(Forge):
+    """GitHub through `gh`, REST only except `gh pr ready` (no REST call
+    turns a draft into a ready pull request)."""
+
+    CHECK_STATES = {"success": "pass", "failure": "fail", "timed_out": "fail", "cancelled": "fail",
+                    "action_required": "fail", "startup_failure": "fail", "stale": "fail",
+                    "error": "fail", "skipped": "skipped", "neutral": "skipped", "pending": "pending"}
+
+    def __init__(self):
+        self.repo = os.environ.get("FORGE_REPO")
+
+    # ---- gh ----
+
+    def gh(self, *args, payload=None):
+        try:
+            res = subprocess.run(["gh", *args], capture_output=True, text=True,
+                                 input=json.dumps(payload) if payload is not None else None)
+        except FileNotFoundError:
+            raise ForgeError("`gh` est introuvable ; installe GitHub CLI et connecte-toi (`gh auth login`)")
+        if res.returncode != 0:
+            err = (res.stderr or res.stdout).strip()
+            m = re.search(r"\(HTTP (\d+)\)", err)
+            raise GhError(err.removeprefix("gh: "), int(m.group(1)) if m else None)
+        return res.stdout
+
+    def api(self, method, path, payload=None, paginate=False):
+        repo = self.repo or "{owner}/{repo}"
+        endpoint = path if path == "user" else f"repos/{repo}/{path}"
+        args = ["api", "-X", method, endpoint]
+        if paginate:
+            args += ["--paginate", "--slurp"]
+        if payload is not None:
+            args += ["--input", "-"]
+        out = self.gh(*args, payload=payload)
+        data = json.loads(out) if out.strip() else None
+        if paginate:
+            data = [item for page in data for item in (page if isinstance(page, list) else [page])]
+        return data
+
+    def issue(self, number):
+        try:
+            return self.api("GET", f"issues/{int(number)}")
+        except GhError as e:
+            if e.status == 404:
+                raise ForgeError(f"ticket #{number} introuvable")
+            raise
+
+    def pull(self, number):
+        try:
+            return self.api("GET", f"pulls/{int(number)}")
+        except GhError as e:
+            if e.status == 404:
+                raise ForgeError(f"demande de fusion #{number} introuvable")
+            raise
+
+    # ---- identity and tickets ----
+
+    def whoami(self):
+        return {"login": self.api("GET", "user")["login"]}
+
+    def tickets(self, label):
+        issues = self.api("GET", f"issues?state=open&labels={quote(label)}&per_page=100", paginate=True)
+        rows = []
+        for i in sorted((i for i in issues if "pull_request" not in i), key=lambda i: i["number"]):
+            rows.append({"number": i["number"], "title": i["title"], "url": i["html_url"],
+                         "labels": [l["name"] for l in i["labels"]],
+                         "blockers": self._blockers(i)})
+        return rows
+
+    def blockers(self, number):
+        return self._blockers(self.issue(number))
+
+    def _blockers(self, issue):
+        n = issue["number"]
+        open_ = set()
+        try:
+            native = self.api("GET", f"issues/{n}/dependencies/blocked_by?per_page=100", paginate=True)
+            open_ |= {b["number"] for b in native if b["state"] == "open"}
+        except GhError as e:
+            if e.status not in (404, 410):
+                # Readable but refused (403…): fail closed rather than miss a blocker.
+                raise ForgeError(f"bloqueurs du ticket #{n} illisibles : {e}")
+            # No native relation on this forge instance: the written convention
+            # below is the fallback.
+        for b in written_blockers(issue.get("body")) - open_ - {n}:
+            try:
+                if self.api("GET", f"issues/{b}")["state"] == "open":
+                    open_.add(b)
+            except GhError:
+                open_.add(b)
+        return sorted(open_)
+
+    def ticket_view(self, number, allow=()):
+        issue = self.issue(number)
+        if "pull_request" in issue:
+            raise ForgeError(f"#{number} est une demande de fusion, pas un ticket")
+        author = issue["user"]["login"]
+        trusted = {author, self.whoami()["login"], *allow}
+        comments = self.api("GET", f"issues/{int(number)}/comments?per_page=100", paginate=True)
+        return {
+            "number": issue["number"], "title": issue["title"], "body": issue["body"] or "",
+            "author": author, "state": issue["state"], "url": issue["html_url"],
+            "labels": [l["name"] for l in issue["labels"]],
+            "comments": [{"author": c["user"]["login"], "body": c["body"] or "", "created_at": c["created_at"]}
+                         for c in comments if c["user"]["login"] in trusted],
+        }
+
+    def ticket_create(self, title, body, labels):
+        issue = self.api("POST", "issues", {"title": title, "body": body, "labels": list(labels)})
+        return {"number": issue["number"], "url": issue["html_url"]}
+
+    def ticket_comment(self, number, body):
+        self.issue(number)
+        self.api("POST", f"issues/{int(number)}/comments", {"body": body})
+
+    def ticket_label(self, number, add=(), remove=()):
+        self.issue(number)
+        if add:
+            self.api("POST", f"issues/{int(number)}/labels", {"labels": list(add)})
+        for name in remove:
+            try:
+                self.api("DELETE", f"issues/{int(number)}/labels/{quote(name, safe='')}")
+            except GhError as e:
+                if e.status != 404:
+                    raise
+
+    # ---- merge requests ----
+
+    def _mr_ref(self, pull):
+        return {"number": pull["number"], "url": pull["html_url"]}
+
+    def mr_find(self, head):
+        owner = self.repo.split("/")[0] if self.repo else "{owner}"
+        pulls = self.api("GET", f"pulls?state=open&head={owner}:{quote(head, safe='')}&per_page=100")
+        pulls = [p for p in pulls if p["head"]["ref"] == head]
+        return self._mr_ref(pulls[0]) if pulls else None
+
+    def mr_create(self, head, base, title, body):
+        pull = self.api("POST", "pulls", {"head": head, "base": base, "title": title,
+                                          "body": body, "draft": True})
+        return self._mr_ref(pull)
+
+    def mr_edit(self, number, title=None, body=None):
+        self.pull(number)
+        change = {k: v for k, v in (("title", title), ("body", body)) if v is not None}
+        if change:
+            self.api("PATCH", f"pulls/{int(number)}", change)
+
+    def mr_view(self, number):
+        p = self.pull(number)
+        state = "merged" if p.get("merged") or p.get("merged_at") else p["state"]
+        return {"number": p["number"], "title": p["title"], "body": p["body"] or "", "url": p["html_url"],
+                "state": state, "draft": bool(p.get("draft")), "author": p["user"]["login"],
+                "head": p["head"]["ref"], "head_sha": p["head"]["sha"], "base": p["base"]["ref"]}
+
+    def mr_ready(self, number):
+        if self.pull(number).get("draft"):
+            self.gh("pr", "ready", str(int(number)), *(["-R", self.repo] if self.repo else []))
+
+    def mr_comment(self, number, body):
+        self.pull(number)
+        self.api("POST", f"issues/{int(number)}/comments", {"body": body})
+
+    def mr_close(self, number):
+        self.pull(number)
+        self.api("PATCH", f"pulls/{int(number)}", {"state": "closed"})
+
+    def mr_status(self, number):
+        p = self.pull(number)
+        sha = p["head"]["sha"]
+        checks = []
+        runs = self.api("GET", f"commits/{sha}/check-runs?per_page=100", paginate=True)
+        for page in runs:
+            for r in page.get("check_runs", []):
+                state = self.CHECK_STATES.get(r.get("conclusion"), "fail") if r["status"] == "completed" else "pending"
+                checks.append({"name": r["name"], "state": state})
+        for s in self.api("GET", f"commits/{sha}/status").get("statuses", []):
+            checks.append({"name": s["context"], "state": self.CHECK_STATES.get(s["state"], "fail")})
+        last = {}
+        for r in self.api("GET", f"pulls/{int(number)}/reviews?per_page=100", paginate=True):
+            if r["state"] in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+                last[r["user"]["login"]] = (r["state"], r.get("commit_id"))
+        # An approval counts only for the commit it was given on.
+        return {"head_sha": sha, "checks": checks,
+                "approved_by": sorted(u for u, (s, c) in last.items() if s == "APPROVED" and c == sha),
+                "stale_approved_by": sorted(u for u, (s, c) in last.items() if s == "APPROVED" and c != sha),
+                "changes_requested_by": sorted(u for u, (s, _) in last.items() if s == "CHANGES_REQUESTED")}
+
+    def mr_merge(self, number, head, method):
+        # `gh pr merge --match-head-commit` exists (checked in gh 2.104.0) but goes through GraphQL;
+        # the REST `sha` parameter gives the same guarantee: GitHub refuses (409) when
+        # the head is no longer that commit.
+        if not re.fullmatch(r"[0-9a-f]{40}", head or ""):
+            raise ForgeError(f"--head doit être le SHA complet d'un commit (40 caractères hexadécimaux), pas {head!r}")
+        current = self.pull(number)["head"]["sha"]
+        if current != head:
+            raise ForgeError(f"la tête de la demande de fusion #{number} est {current}, pas {head} : fusion refusée")
+        try:
+            out = self.api("PUT", f"pulls/{int(number)}/merge", {"sha": head, "merge_method": method})
+        except GhError as e:
+            if e.status == 409:
+                raise ForgeError(f"la tête de la demande de fusion #{number} n'est plus {head} : "
+                                 f"fusion refusée ({e})")
+            raise ForgeError(f"fusion de la demande #{number} refusée : {e}")
+        return {"merged": bool(out.get("merged")), "sha": out.get("sha")}
+
+    def protection(self, branch):
+        out = {"branch": branch, "protected": False, "required_checks": [], "required_approvals": 0,
+               "enforce_admins": False, "rules": []}
+        try:
+            p = self.api("GET", f"branches/{quote(branch, safe='')}/protection")
+            checks = (p.get("required_status_checks") or {})
+            names = [c["context"] for c in checks.get("checks") or []] or list(checks.get("contexts") or [])
+            out.update(protected=True, required_checks=names,
+                       required_approvals=(p.get("required_pull_request_reviews") or {})
+                       .get("required_approving_review_count", 0),
+                       enforce_admins=bool((p.get("enforce_admins") or {}).get("enabled")))
+        except GhError as e:
+            if e.status != 404:
+                raise ForgeError(f"protection de {branch} illisible : {e}")
+        try:
+            rules = self.api("GET", f"rules/branches/{quote(branch, safe='')}")
+        except GhError as e:
+            if e.status != 404:
+                raise ForgeError(f"règles de {branch} illisibles : {e}")
+            rules = []
+        out["rules"] = sorted({r["type"] for r in rules})
+        if rules:
+            out["protected"] = True
+        for r in rules:
+            params = r.get("parameters") or {}
+            if r["type"] == "required_status_checks":
+                out["required_checks"] += [c["context"] for c in params.get("required_status_checks", [])
+                                           if c["context"] not in out["required_checks"]]
+            if r["type"] == "pull_request":
+                out["required_approvals"] = max(out["required_approvals"],
+                                                params.get("required_approving_review_count", 0))
+        return out
+
+
+ADAPTERS = {"github": GitHub}
+
+
+def adapter():
+    kind = os.environ.get("FORGE")
+    if not kind:
+        try:
+            kind = json.loads(CONFIG_PATH.read_text()).get("forge", "github")
+        except (OSError, ValueError):
+            kind = "github"
+    if kind not in ADAPTERS:
+        raise ForgeError(f"aucun adaptateur installé pour la forge « {kind} » "
+                         f"(disponibles : {', '.join(sorted(ADAPTERS))})")
+    return ADAPTERS[kind]()
+
+
+def body_of(args, stdin_default=False):
+    if getattr(args, "body_file", None):
+        return Path(args.body_file).read_text()
+    if getattr(args, "body", None) is not None:
+        return args.body
+    return sys.stdin.read() if stdin_default else None
+
+
+def split(values):
+    return [v for value in values or [] for v in value.split(",") if v]
+
+
+def parser():
+    p = argparse.ArgumentParser(prog="forge", description="Forge-neutral access for the factory.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("whoami")
+    s = sub.add_parser("tickets")
+    s.add_argument("--label", required=True)
+    s = sub.add_parser("blockers")
+    s.add_argument("number", type=int)
+    s = sub.add_parser("protection")
+    s.add_argument("branch")
+
+    def body(s):
+        g = s.add_mutually_exclusive_group()
+        g.add_argument("--body")
+        g.add_argument("--body-file")
+
+    t = sub.add_parser("ticket").add_subparsers(dest="op", required=True)
+    s = t.add_parser("view")
+    s.add_argument("number", type=int)
+    s.add_argument("--allow", action="append", default=[])
+    s = t.add_parser("create")
+    s.add_argument("--title", required=True)
+    body(s)
+    s.add_argument("--label", action="append", default=[])
+    s = t.add_parser("comment")
+    s.add_argument("number", type=int)
+    body(s)
+    s = t.add_parser("label")
+    s.add_argument("number", type=int)
+    s.add_argument("--add", action="append", default=[])
+    s.add_argument("--remove", action="append", default=[])
+
+    m = sub.add_parser("mr").add_subparsers(dest="op", required=True)
+    s = m.add_parser("find")
+    s.add_argument("--head", required=True)
+    s = m.add_parser("create")
+    s.add_argument("--head", required=True)
+    s.add_argument("--base", required=True)
+    s.add_argument("--title", required=True)
+    body(s)
+    s = m.add_parser("edit")
+    s.add_argument("number", type=int)
+    s.add_argument("--title")
+    body(s)
+    for op in ("view", "ready", "close", "status"):
+        m.add_parser(op).add_argument("number", type=int)
+    s = m.add_parser("comment")
+    s.add_argument("number", type=int)
+    body(s)
+    s = m.add_parser("merge")
+    s.add_argument("number", type=int)
+    s.add_argument("--head", required=True, help="commit the request's head must be")
+    s.add_argument("--method", choices=MERGE_METHODS, default="merge")
+    return p
+
+
+def run(args):
+    f = adapter()
+    if args.cmd == "whoami":
+        return f.whoami()
+    if args.cmd == "tickets":
+        return f.tickets(args.label)
+    if args.cmd == "blockers":
+        return f.blockers(args.number)
+    if args.cmd == "protection":
+        return f.protection(args.branch)
+    if args.cmd == "ticket":
+        if args.op == "view":
+            return f.ticket_view(args.number, split(args.allow))
+        if args.op == "create":
+            return f.ticket_create(args.title, body_of(args) or "", split(args.label))
+        if args.op == "comment":
+            return f.ticket_comment(args.number, body_of(args, stdin_default=True))
+        if args.op == "label":
+            return f.ticket_label(args.number, split(args.add), split(args.remove))
+    if args.op == "find":
+        return f.mr_find(args.head)
+    if args.op == "create":
+        return f.mr_create(args.head, args.base, args.title, body_of(args) or "")
+    if args.op == "edit":
+        return f.mr_edit(args.number, args.title, body_of(args))
+    if args.op == "comment":
+        return f.mr_comment(args.number, body_of(args, stdin_default=True))
+    if args.op == "merge":
+        return f.mr_merge(args.number, args.head, args.method)
+    return getattr(f, f"mr_{args.op}")(args.number)
+
+
+NO_OUTPUT = {("ticket", "comment"), ("ticket", "label"), ("mr", "edit"), ("mr", "ready"),
+             ("mr", "comment"), ("mr", "close")}
+
+
+def main():
+    args = parser().parse_args()
+    try:
+        out = run(args)
+    except (ForgeError, OSError) as e:
+        print(f"forge: {e}", file=sys.stderr)
+        sys.exit(1)
+    if (args.cmd, getattr(args, "op", None)) not in NO_OUTPUT:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
