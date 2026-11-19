@@ -98,8 +98,8 @@ class FakeWorld:
                        "created_at": f"2026-11-19T09:{len(cs):02d}:00Z"})
         self.edit(add)
 
-    def close(self, n):
-        self.edit(lambda s: s["issues"][str(n)].update(state="closed"))
+    def close(self, n, reason="completed"):
+        self.edit(lambda s: s["issues"][str(n)].update(state="closed", state_reason=reason))
 
     def block(self, n, by):
         self.edit(lambda s: s["deps"].setdefault(str(n), []).append(by))
@@ -217,8 +217,8 @@ class LiveWorld:
             self.skip("another author")
         self.api(self.r(f"issues/{n}/comments"), "POST", {"body": body})
 
-    def close(self, n):
-        self.api(self.r(f"issues/{n}"), "PATCH", {"state": "closed"})
+    def close(self, n, reason="completed"):
+        self.api(self.r(f"issues/{n}"), "PATCH", {"state": "closed", "state_reason": reason})
 
     def block(self, n, by):
         issue_id = self.api(self.r(f"issues/{by}"))["id"]
@@ -420,6 +420,20 @@ class ForgeContract(unittest.TestCase):
         n = self.world.ticket("blocked", body="Bloqué par #99999")
         self.assertEqual(self.forge_json("blockers", str(n)), [99999])
 
+    def test_blocker_closed_without_being_done_still_blocks(self):
+        # A blocker counts as done only when closed as completed: « not planned »
+        # or « duplicate » leaves the work it stood for undone.
+        native = self.world.ticket("native, not planned")
+        written = self.world.ticket("written, duplicate")
+        done = self.world.ticket("done")
+        n = self.world.ticket("blocked", body=f"Bloqué par #{written}, #{done}", labels=[self.label])
+        self.world.block(n, native)
+        self.world.close(native, "not_planned")
+        self.world.close(written, "duplicate")
+        self.world.close(done)
+        self.assertEqual(self.forge_json("blockers", str(n)), sorted([native, written]))
+        self.assertEqual(self.forge_json("tickets", "--label", self.label)[0]["blockers"], sorted([native, written]))
+
     def test_text_that_only_mentions_a_ticket_is_not_a_blocker(self):
         other = self.world.ticket("other")
         n = self.world.ticket("not blocked", body=f"See #{other}. Not « bloqué par » anything.")
@@ -520,6 +534,25 @@ class ForgeContract(unittest.TestCase):
         self.assertEqual(self.world.comments(n), ["note"])
         self.forge_ok("mr", "close", str(n))
         self.assertEqual(self.forge_json("mr", "view", str(n))["state"], "closed")
+
+    def test_mrs_lists_open_merge_requests_with_their_draft_flag(self):
+        ready, ready_head = self.world.mr(title="Ready", draft=False)
+        draft, _ = self.world.mr(title="Draft")
+        closed, _ = self.world.mr(title="Closed", draft=False)
+        self.forge_ok("mr", "close", str(closed))
+        rows = {r["number"]: r for r in self.forge_json("mrs")}
+        self.assertIn(ready, rows)
+        self.assertIn(draft, rows)
+        self.assertNotIn(closed, rows)
+        self.assertEqual((rows[ready]["draft"], rows[ready]["head"], rows[ready]["title"]), (False, ready_head, "Ready"))
+        self.assertTrue(rows[draft]["draft"])
+        self.assertEqual(set(rows[ready]), {"number", "title", "url", "draft", "head", "author"})
+
+    def test_mrs_when_the_forge_refuses_fails_cleanly(self):
+        if self.world.live:
+            self.world.skip("a real forge can't be made to refuse")
+        self.world.edit(lambda s: s.update(pulls_error=502))
+        self.forge_fails("mrs")
 
     def test_mr_view_of_a_missing_request_fails_cleanly(self):
         self.forge_fails("mr", "view", "99999")

@@ -10,13 +10,14 @@ usage errors exit 2.
 Usage:
   forge whoami                                  {"login"}
   forge permissions                             {"push", "label", "merge"}: the account's rights here
-  forge tickets --label L                       open tickets carrying L, with their open blockers
-  forge blockers <n>                            open tickets blocking <n>
+  forge tickets --label L                       open tickets carrying L, with their unfinished blockers
+  forge blockers <n>                            unfinished tickets blocking <n>
   forge ticket view <n> [--allow LOGIN]...      ticket, with only the comments of its author,
                                                 of the operator and of each --allow login
   forge ticket create --title T [--body B | --body-file F] [--label L]...
   forge ticket comment <n> [--body B | --body-file F]   (body from stdin otherwise)
   forge ticket label <n> [--add L]... [--remove L]...   (L may be comma-separated)
+  forge mrs                                     open merge requests: number, title, url, draft, head, author
   forge mr find --head BRANCH                   open merge request from BRANCH, or null
   forge mr create --head B --base B --title T [--body B | --body-file F]   always a draft
   forge mr edit <n> [--title T] [--body B | --body-file F]
@@ -32,8 +33,12 @@ Usage:
 
 Blockers are the forge's native « blocked by » relation, plus the written
 convention « Bloqué par #n » in the ticket body (the fallback where the
-relation doesn't exist). A native relation that exists but can't be read
-is an error. A written blocker that can't be read counts as open: waiting costs nothing, starting a blocked ticket costs a job.
+relation doesn't exist). A blocker is finished only when it is closed as
+done (GitHub: state_reason `completed`); one closed as not planned or as a
+duplicate still blocks, since the work it stood for wasn't merged. A native
+relation that exists but can't be read is an error. A written blocker that
+can't be read counts as unfinished: waiting costs nothing, starting a blocked
+ticket costs a job.
 
 Environment: FORGE picks the adapter (default: `forge` in factory/config.json,
 else github). FORGE_REPO=owner/name targets another repository than the
@@ -73,6 +78,7 @@ class Forge:
     def whoami(self): raise NotImplementedError
     def permissions(self): raise NotImplementedError
     def tickets(self, label): raise NotImplementedError
+    def mrs(self): raise NotImplementedError
     def blockers(self, number): raise NotImplementedError
     def ticket_view(self, number, allow=()): raise NotImplementedError
     def ticket_create(self, title, body, labels): raise NotImplementedError
@@ -179,12 +185,16 @@ class GitHub(Forge):
     def blockers(self, number):
         return self._blockers(self.issue(number))
 
+    @staticmethod
+    def finished(issue):
+        return issue["state"] == "closed" and issue.get("state_reason") == "completed"
+
     def _blockers(self, issue):
         n = issue["number"]
         open_ = set()
         try:
             native = self.api("GET", f"issues/{n}/dependencies/blocked_by?per_page=100", paginate=True)
-            open_ |= {b["number"] for b in native if b["state"] == "open"}
+            open_ |= {b["number"] for b in native if not self.finished(b)}
         except GhError as e:
             if e.status not in (404, 410):
                 # Readable but refused (403…): fail closed rather than miss a blocker.
@@ -193,7 +203,7 @@ class GitHub(Forge):
             # below is the fallback.
         for b in written_blockers(issue.get("body")) - open_ - {n}:
             try:
-                if self.api("GET", f"issues/{b}")["state"] == "open":
+                if not self.finished(self.api("GET", f"issues/{b}")):
                     open_.add(b)
             except GhError:
                 open_.add(b)
@@ -237,6 +247,15 @@ class GitHub(Forge):
 
     def _mr_ref(self, pull):
         return {"number": pull["number"], "url": pull["html_url"]}
+
+    def mrs(self):
+        try:
+            pulls = self.api("GET", "pulls?state=open&per_page=100", paginate=True)
+        except GhError as e:
+            raise ForgeError(f"demandes de fusion illisibles : {e}")
+        return [{"number": p["number"], "title": p["title"], "url": p["html_url"],
+                 "draft": bool(p.get("draft")), "head": p["head"]["ref"], "author": p["user"]["login"]}
+                for p in sorted(pulls, key=lambda p: p["number"])]
 
     def mr_find(self, head):
         owner = self.repo.split("/")[0] if self.repo else "{owner}"
@@ -379,6 +398,7 @@ def parser():
     p = argparse.ArgumentParser(prog="forge", description="Forge-neutral access for the factory.")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("whoami")
+    sub.add_parser("mrs")
     sub.add_parser("permissions")
     s = sub.add_parser("tickets")
     s.add_argument("--label", required=True)
@@ -440,6 +460,8 @@ def run(args):
         return f.permissions()
     if args.cmd == "tickets":
         return f.tickets(args.label)
+    if args.cmd == "mrs":
+        return f.mrs()
     if args.cmd == "blockers":
         return f.blockers(args.number)
     if args.cmd == "protection":

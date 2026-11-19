@@ -174,9 +174,12 @@ then moves the job to `merged`; stop any agents still running for it.
    don't stop the run; repeat them to the user.
 1. Run `factory/bin/job queue`. Each line is `action  issue  job  stage  note`:
    `resume` (pick it up from its stage), `new` (no job yet), `hold` (no free
-   slot), `blocked` (an open issue blocks it: start nothing, the note names the
-   blockers, and a later `queue` lets it through once they are closed), `wait`
-   (needs the author or you) or `skip`. The script enforces
+   slot, or the merge requests waiting for a human reached
+   `max_waiting_for_human`), `blocked` (a blocker isn't merged yet: start
+   nothing, the note names the blockers, and a later `queue` lets it through
+   once they are closed as done), `wait` (needs the author or you) or `skip`.
+   Show the user every `blocked` and `hold` line with its note, verbatim: the
+   note is the reason the issue isn't admitted. The script enforces
    `concurrency`: every job in a running stage holds a slot, and only as many
    `new` and replied `needs-info` lines as there are free slots come out as
    `new` or `resume`; the rest are `hold`. `job create` and the
@@ -205,7 +208,9 @@ as `resume`: run `factory/bin/job advance <id> intake` and go to **intake**.
 
 Run one issue with the same steps, `factory/bin/doctor` first. If `factory/bin/job queue` shows a job for
 it, resume that job; otherwise `factory/bin/job create <n>`, which refuses an
-issue that has an open blocker: tell the user which ones and stop. Finish with
+issue that has an unmerged blocker, or while the merge requests waiting for a
+human reach `max_waiting_for_human`: show the user its refusal verbatim and
+stop. Finish with
 the summary line for that job.
 
 ## /factory <anything>

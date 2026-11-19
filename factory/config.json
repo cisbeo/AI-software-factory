@@ -1,5 +1,6 @@
 {
   "concurrency": 1,
+  "max_waiting_for_human": 3,
   "retry_budget": 3,
   "max_cost_usd": 25,
   "max_duration_minutes": 480,
