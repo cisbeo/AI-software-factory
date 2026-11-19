@@ -27,6 +27,14 @@ MUTATIONS = [
  ("route: risque faible routé comme moyen", "factory/bin/route", 'reviewers = dict(risk)', 'reviewers = dict(CONFIG["routing"]["medium"]) if intake["risk"] == "low" else dict(risk)', "test_route"),
  ("route: surface inconnue ignorée", "factory/bin/route", 'if extra is None:\n            die(', 'if extra is None:\n            continue\n            die(', "test_route"),
  ("gate: trace non écrite", "factory/bin/gate", 'f.write(json.dumps(trace) + "\\n")', 'pass', "test_gate.Trace"),
+ ("doctor: version minimale ignorée", "factory/bin/doctor", 'if v < MINIMUM[name]:', 'if False:', "test_doctor.Tools"),
+ ("doctor: version illisible acceptée", "factory/bin/doctor", 'm.groups()) if m else None', 'm.groups()) if m else (99, 0, 0)', "test_doctor.Tools"),
+ ("doctor: droits manquants ignorés", "factory/bin/doctor", 'if lacking:', 'if False:', "test_doctor.ForgeAccess"),
+ ("doctor: arbre sale accepté", "factory/bin/doctor", 'if status.stdout.strip():', 'if False:', "test_doctor.WorkingTree"),
+ ("doctor: base en retard acceptée", "factory/bin/doctor", 'if local_sha == remote_sha:', 'if True:', "test_doctor.BaseBranch"),
+ ("doctor: tarifs anciens non signalés", "factory/bin/doctor", 'if age > PRICES_MAX_AGE_DAYS:', 'if False:', "test_doctor.Prices"),
+ ("doctor: modèle refusé accepté", "factory/bin/doctor", 'if answer["is_error"] or res.returncode != 0:', 'if False:', "test_doctor.Models"),
+ ("forge: le triage compte comme écriture", "factory/bin/forge", 'write = any(perms.get(k) for k in ("admin", "maintain", "push"))', 'write = any(perms.get(k) for k in ("admin", "maintain", "push", "triage"))', "test_forge_contract"),
 ]
 
 

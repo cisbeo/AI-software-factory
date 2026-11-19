@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""factory doctor: are the factory's prerequisites met here? (spec §11.1)
+
+Read-only diagnosis of the repository the command runs in. It stops at the
+first thing missing and prints the fix to make. Run it any time; `/factory run`
+runs it first.
+
+Checks, in order (the costly one last):
+  1. Claude Code, git and python3 at their minimum versions
+  2. the forge's command line, logged in, through factory/bin/forge
+  3. the account's rights on the repository: push, label, merge
+  4. a clean working tree
+  5. the base branch (config `base_branch`) equal to its remote copy
+  6. dated prices (config `prices_as_of`); older than 90 days is flagged, not blocking
+  7. every model named in the config's routing answers a one-line prompt
+
+Exit status: 0 ready (warnings allowed), 1 something to fix, 2 usage error.
+"""
+
+import argparse
+import datetime
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+FACTORY = Path(__file__).resolve().parents[1]
+CONFIG_PATH = FACTORY / "config.json"
+FORGE = FACTORY / "bin" / "forge"
+
+# Minimum versions (issue #6).
+#   Claude Code: the changelog establishes 2.1.0 (hooks in agent frontmatter, the
+#     builder's Stop hook); the release that brought SendMessage, used to resume the
+#     builder, isn't established, so the installed version on 2026-11-19 is the
+#     provisional floor until it is.
+#   git: 2.17 brought `git worktree remove`, which `job` uses.
+#   python3: 3.9 brought str.removeprefix, which `job` and `forge` use.
+MINIMUM = {"claude": (2, 1, 285), "git": (2, 17, 0), "python3": (3, 9, 0)}
+INSTALL = {
+    "claude": "installe Claude Code (https://code.claude.com/docs/en/setup) ou mets-le à jour avec `claude update`",
+    "git": "installe ou mets à jour git (https://git-scm.com/downloads)",
+    "python3": "installe ou mets à jour Python 3 (https://www.python.org/downloads/)",
+}
+PRICES_MAX_AGE_DAYS = 90
+MODEL_TIMEOUT_S = 180
+
+
+class Missing(Exception):
+    """A prerequisite isn't met: what is wrong, and the fix."""
+
+    def __init__(self, what, fix):
+        super().__init__(what)
+        self.what, self.fix = what, fix
+
+
+def ok(label, detail):
+    print(f"ok    {label} : {detail}", flush=True)
+
+
+def warn(label, detail):
+    print(f"warn  {label} : {detail}", flush=True)
+
+
+def sh(*cmd, cwd=None, timeout=60):
+    try:
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return None
+
+
+def version_tuple(text):
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text or "")
+    return tuple(int(g or 0) for g in m.groups()) if m else None
+
+
+def fmt(v):
+    return ".".join(map(str, v))
+
+
+# ---- checks ----------------------------------------------------------------
+
+def load_config():
+    try:
+        config = json.loads(CONFIG_PATH.read_text())
+        if not isinstance(config, dict):
+            raise ValueError("pas un objet JSON")
+    except (OSError, ValueError) as e:
+        raise Missing(f"factory/config.json illisible ({e})", "corrige factory/config.json (JSON valide)")
+    return config
+
+
+def configured_models(config):
+    models = set()
+    for section in ("routing", "surface_reviewers"):
+        table = config.get(section)
+        if not isinstance(table, dict):
+            raise Missing(f"config `{section}` absente ou illisible", f"donne à `{section}` sa table dans factory/config.json")
+        for key, reviewers in table.items():
+            if not isinstance(reviewers, dict):
+                raise Missing(f"config `{section}.{key}` illisible", f"corrige `{section}.{key}` dans factory/config.json")
+            for reviewer, model in reviewers.items():
+                if not isinstance(model, str) or not model.strip():
+                    raise Missing(f"config `{section}.{key}.{reviewer}` : {model!r} n'est pas un nom de modèle",
+                                  f"corrige `{section}.{key}.{reviewer}` dans factory/config.json")
+                models.add(model)
+    return sorted(models)
+
+
+def check_tool(name):
+    res = sh(name, "--version")
+    if res is None:
+        raise Missing(f"{name} introuvable dans le PATH", INSTALL[name])
+    out = (res.stdout or res.stderr).strip()
+    v = version_tuple(out) if res.returncode == 0 else None
+    if v is None:
+        raise Missing(f"{name} : version illisible ({out!r})", INSTALL[name])
+    if v < MINIMUM[name]:
+        raise Missing(f"{name} {fmt(v)} est plus ancien que le minimum {fmt(MINIMUM[name])}", INSTALL[name])
+    ok(name, f"{fmt(v)} (minimum {fmt(MINIMUM[name])})")
+
+
+def forge(*args):
+    res = sh(sys.executable, "-B", str(FORGE), *args)
+    if res is None or res.returncode != 0:
+        msg = (res.stderr if res else "").strip().removeprefix("forge: ") or "échec sans message"
+        if "introuvable" in msg:
+            fix = "installe la CLI de la forge (GitHub CLI : https://cli.github.com) puis `gh auth login`"
+        elif "auth login" in msg:
+            fix = "connecte-toi : `gh auth login`"
+        else:
+            fix = f"vérifie l'accès à la forge : `factory/bin/forge {' '.join(args)}`"
+        raise Missing(f"forge {' '.join(args)} : {msg}", fix)
+    try:
+        return json.loads(res.stdout)
+    except ValueError:
+        raise Missing(f"forge {' '.join(args)} : réponse illisible", "signale-le : la sortie de forge doit être du JSON")
+
+
+def check_forge():
+    who = forge("whoami")
+    login = who.get("login") if isinstance(who, dict) else None
+    if not isinstance(login, str) or not login:
+        raise Missing(f"forge : identité illisible ({who!r})", "reconnecte la CLI de la forge : `gh auth login`")
+    ok("forge", f"CLI authentifiée en tant que {login}")
+    perms = forge("permissions")
+    if not isinstance(perms, dict) or not all(isinstance(perms.get(k), bool) for k in ("push", "label", "merge")):
+        raise Missing(f"droits sur le dépôt illisibles ({perms!r})", "vérifie `factory/bin/forge permissions`")
+    words = {"push": "pousser", "label": "étiqueter", "merge": "fusionner"}
+    lacking = [words[k] for k in ("push", "label", "merge") if not perms[k]]
+    if lacking:
+        raise Missing(f"le compte {login} ne peut pas {', '.join(lacking)} sur ce dépôt",
+                      "fais-lui donner le rôle Write (ou plus) sur le dépôt")
+    ok("droits", "pousser, étiqueter, fusionner")
+
+
+def check_tree():
+    res = sh("git", "rev-parse", "--show-toplevel")
+    if res is None or res.returncode != 0:
+        raise Missing("le dossier courant n'est pas dans un dépôt git", "lance doctor depuis le dépôt de la factory")
+    top = res.stdout.strip()
+    status = sh("git", "status", "--porcelain", cwd=top)
+    if status.returncode != 0:
+        raise Missing(f"git status a échoué : {status.stderr.strip()}", "répare le dépôt (`git status`)")
+    if status.stdout.strip():
+        lines = status.stdout.rstrip("\n").splitlines()
+        shown = "; ".join(l.strip() for l in lines[:5]) + (" …" if len(lines) > 5 else "")
+        raise Missing(f"répertoire de travail pas propre ({shown})",
+                      "valide, remise ou annule ces changements (`git status`)")
+    ok("répertoire de travail", "propre")
+    return top
+
+
+def check_base(top, base):
+    if not isinstance(base, str) or not base:
+        raise Missing(f"config `base_branch` illisible ({base!r})", "donne `base_branch` dans factory/config.json")
+    remote = sh("git", "ls-remote", "--exit-code", "origin", f"refs/heads/{base}", cwd=top, timeout=60)
+    if remote.returncode == 2:
+        raise Missing(f"la branche de base {base} n'existe pas sur origin",
+                      f"pousse {base} sur origin ou corrige `base_branch` dans factory/config.json")
+    if remote.returncode != 0:
+        raise Missing(f"origin injoignable : {remote.stderr.strip()}",
+                      "ajoute ou répare le dépôt distant `origin` (`git remote -v`)")
+    remote_sha = remote.stdout.split()[0] if remote.stdout.split() else ""
+    if not re.fullmatch(r"[0-9a-f]{40}", remote_sha):
+        raise Missing(f"réponse illisible de git ls-remote pour {base}", "vérifie `git ls-remote origin`")
+    local = sh("git", "rev-parse", "--verify", "-q", f"refs/heads/{base}^{{commit}}", cwd=top)
+    if local.returncode != 0:
+        raise Missing(f"pas de branche locale {base}", f"crée-la : `git fetch origin {base}:{base}`")
+    local_sha = local.stdout.strip()
+    if local_sha == remote_sha:
+        ok("branche de base", f"{base} à jour avec origin ({local_sha[:7]})")
+        return
+    known = sh("git", "cat-file", "-e", f"{remote_sha}^{{commit}}", cwd=top).returncode == 0
+    if not known or sh("git", "merge-base", "--is-ancestor", local_sha, remote_sha, cwd=top).returncode == 0:
+        raise Missing(f"{base} est en retard sur origin/{base}",
+                      f"mets-la à jour : `git pull --ff-only` sur {base}, "
+                      f"ou `git fetch origin {base}:{base}` depuis une autre branche")
+    if sh("git", "merge-base", "--is-ancestor", remote_sha, local_sha, cwd=top).returncode == 0:
+        raise Missing(f"{base} est en avance sur origin/{base} (commits locaux non poussés)",
+                      f"passe ces commits par une demande de fusion, puis `git reset --keep origin/{base}` sur {base}")
+    raise Missing(f"{base} a divergé de origin/{base}",
+                  f"range les commits locaux sur une autre branche, puis `git reset --keep origin/{base}` sur {base}")
+
+
+def check_prices(config):
+    raw = config.get("prices_as_of")
+    if raw is None:
+        raise Missing("tarifs non datés : `prices_as_of` manque dans factory/config.json",
+                      "vérifie `prices_usd_per_mtok` et note la date dans `prices_as_of` (AAAA-MM-JJ)")
+    try:
+        if not isinstance(raw, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            raise ValueError
+        when = datetime.date.fromisoformat(raw)
+    except ValueError:
+        raise Missing(f"`prices_as_of` illisible ({raw!r})", "écris la date au format AAAA-MM-JJ")
+    age = (datetime.date.today() - when).days
+    if age < 0:
+        raise Missing(f"`prices_as_of` est dans le futur ({raw})", "écris la date à laquelle les tarifs ont été relevés")
+    if age > PRICES_MAX_AGE_DAYS:
+        warn("tarifs", f"datés du {raw}, il y a {age} jours (plus de {PRICES_MAX_AGE_DAYS}) : "
+                       "revérifie `prices_usd_per_mtok` et mets à jour `prices_as_of`")
+    else:
+        ok("tarifs", f"datés du {raw} ({age} jours)")
+
+
+def check_models(models):
+    # Run outside the repository so no project setting, hook or instruction file is loaded.
+    with tempfile.TemporaryDirectory(prefix="factory-doctor-") as scratch:
+        for model in models:
+            res = sh("claude", "-p", "--model", model, "--output-format", "json",
+                     "--no-session-persistence", "--tools", "", "Réponds seulement : OK",
+                     cwd=scratch, timeout=MODEL_TIMEOUT_S)
+            if res is None:
+                raise Missing("claude introuvable dans le PATH", INSTALL["claude"])
+            try:
+                answer = json.loads(res.stdout)
+                if not isinstance(answer, dict) or not isinstance(answer.get("is_error"), bool):
+                    raise ValueError
+            except ValueError:
+                raise Missing(f"modèle {model} : réponse illisible ({(res.stdout or res.stderr).strip()[:200]!r})",
+                              f"essaie à la main : `claude -p --model {model} \"OK\"`")
+            if answer["is_error"] or res.returncode != 0:
+                raise Missing(f"modèle {model} inaccessible : {str(answer.get('result', ''))[:200]}",
+                              f"vérifie ton abonnement ou ta clé pour {model}, ou change le modèle dans factory/config.json")
+    ok("modèles", ", ".join(models))
+
+
+def main():
+    argparse.ArgumentParser(prog="doctor", description=__doc__.split("\n")[0]).parse_args()
+    try:
+        config = load_config()
+        models = configured_models(config)
+        for tool in ("claude", "git", "python3"):
+            check_tool(tool)
+        check_forge()
+        top = check_tree()
+        check_base(top, config.get("base_branch"))
+        check_prices(config)
+        check_models(models)
+    except Missing as m:
+        print(f"FAIL  {m.what}\n      Correction : {m.fix}\nDOCTOR: FAIL")
+        sys.exit(1)
+    except subprocess.TimeoutExpired as e:
+        print(f"FAIL  {' '.join(map(str, e.cmd[:4]))} … ne répond pas après {e.timeout} s\n"
+              "      Correction : vérifie le réseau et relance\nDOCTOR: FAIL")
+        sys.exit(1)
+    print("DOCTOR: OK")
+
+
+if __name__ == "__main__":
+    main()
