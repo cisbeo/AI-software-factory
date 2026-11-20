@@ -40,6 +40,13 @@ with the reason in decision.md. A gate INCONCLUSIVE verdict spends nothing:
 stop records one of five exits in job.json `exit`: success (merged), failure
 (rejected), timeout, budget, human (any other escalation or question).
 
+Reviews (spec §7.3). Leaving the review stage needs every review-<r>.md to give
+a verdict per acceptance criterion of spec.md, under `## Criteria`:
+`<n>. PASS|FAIL — <evidence>`, a FAIL only under VERDICT: CHANGES.
+review-spec.md also lists under `## Untested criteria` the criteria no test
+exercises (`- <n>: <why>`, or `None.`); the merge request's factory block
+shows that list to the human.
+
 Traceability (spec §9). On every transition of a job that has a merge
 request, `job` rewrites the factory block of its body (between
 `<!-- factory:summary -->` markers): version, routing reason, retry budget
@@ -526,12 +533,80 @@ def pr_state(job):
     return forge_json("mr", "view", job["pr"])["state"]
 
 
+CRITERION = re.compile(r"(\d+)\.\s+(PASS|FAIL)\s*(?:—|–|-|:)\s*(\S.*)")
+UNTESTED = re.compile(r"- (\d+)\b.*")
+
+
+def spec_criteria(job):
+    """Numbers of the top-level items of spec.md's `## Acceptance criteria`."""
+    body = section(job_dir(job["id"]) / "spec.md", "Acceptance criteria") or ""
+    numbers = [int(m.group(1)) for m in re.finditer(r"^(\d+)\.\s+\S", body, re.M)]
+    require(numbers and numbers == list(range(1, len(numbers) + 1)),
+            "spec.md has no `## Acceptance criteria` numbered 1, 2, 3…: reviews can't give a verdict per criterion")
+    return numbers
+
+
+def sections(path, heading):
+    return re.findall(rf"^## {re.escape(heading)}[ \t]*\n(.*?)(?=^## |\Z)", path.read_text(), re.M | re.S)
+
+
+def review_problems(path, verdict, criteria, untested_list):
+    """What review-<r>.md lacks to give one verdict per criterion, with its
+    evidence (spec §7.3), plus, when `untested_list`, the criteria no test exercises."""
+    found = sections(path, "Criteria")
+    if len(found) != 1:
+        return [f"needs one `## Criteria` section, with a line `<n>. PASS|FAIL — <evidence>` "
+                f"for each criterion {', '.join(map(str, criteria))} of spec.md"]
+    problems, seen = [], {}
+    for line in found[0].splitlines():
+        if not re.match(r"\d+\.", line):
+            continue  # an indented continuation, or prose
+        m = CRITERION.fullmatch(line.strip())
+        n = int(re.match(r"\d+", line).group())
+        if not m:
+            problems.append(f"criterion {n}: write `{n}. PASS — <evidence>` or `{n}. FAIL — <what is missing>`")
+        elif n not in criteria:
+            problems.append(f"criterion {n} isn't in spec.md")
+        elif n in seen:
+            problems.append(f"criterion {n} has two verdicts")
+        else:
+            seen[n] = m.group(2)
+    problems += [f"no verdict for criterion {n}" for n in criteria if n not in seen and
+                 not any(p.startswith(f"criterion {n}") for p in problems)]
+    failed = [n for n, v in seen.items() if v == "FAIL"]
+    if failed and verdict == "PASS":
+        problems.append(f"criterion {failed[0]} is FAIL under VERDICT: PASS")
+    if untested_list:
+        lists = sections(path, "Untested criteria")
+        body = lists[0].strip() if len(lists) == 1 else ""
+        items = [UNTESTED.fullmatch(l.strip()) for l in body.splitlines() if l.strip()]
+        if body != "None." and (not items or not all(items)):
+            problems.append("needs one `## Untested criteria` section: `- <n>: <why no test exercises it>` "
+                            "per criterion, or `None.`")
+        else:
+            problems += [f"untested criterion {m.group(1)} isn't in spec.md"
+                         for m in items if m and int(m.group(1)) not in criteria]
+    return problems
+
+
+def untested_criteria(path):
+    """The numbers review-spec.md lists under `## Untested criteria`, or None."""
+    lists = sections(path, "Untested criteria") if path.exists() else []
+    if len(lists) != 1:
+        return None
+    return [int(m.group(1)) for l in lists[0].splitlines() if (m := UNTESTED.fullmatch(l.strip()))]
+
+
 def check_reviews_done(job):
     rd = round_dir(job)
     missing = [r for r in reviewers(job) if not (rd / f"review-{r}.md").exists()]
     require(not missing, f"round {job['round']} is missing reviews from: {', '.join(missing)}")
     bad = [r for r, v in job["reviews"].items() if v not in {"PASS", "CHANGES"}]
     require(not bad, f"first line isn't a verdict in review-{bad[0]}.md" if bad else "")
+    criteria = spec_criteria(job)
+    for r in reviewers(job):
+        problems = review_problems(rd / f"review-{r}.md", job["reviews"][r], criteria, r == "spec")
+        require(not problems, f"review-{r}.md: " + "; ".join(problems) + " (spec §7.3)")
 
 
 def gated_commit(job, name="checks"):
@@ -808,6 +883,14 @@ def summary_block(job):
     for n in range(1, job["round"] + 1):
         gate, reviews = round_verdicts(job, n)
         lines.append(f"| {n} | {gate} | " + " | ".join(reviews) + (" |" if reviews else ""))
+    # The criteria no test exercises, from the last round reviewer-spec listed them: a
+    # finding for the human to weigh, not an approval (spec §7.3).
+    for n in range(job["round"], 0, -1):
+        untested = untested_criteria(round_dir(job, n) / "review-spec.md")
+        if untested is not None:
+            lines += ["", f"- Criteria no test exercises (reviewer-spec, round {n}): "
+                          + (", ".join(map(str, untested)) or "none")]
+            break
     lines.append(SUMMARY_END)
     return "\n".join(lines)
 

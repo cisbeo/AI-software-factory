@@ -107,7 +107,7 @@ while True:
         else:
             sh(BIN / "job", "advance", jid, {"REJECT": "rejected", "NEEDS-INFO": "needs-info"}[decision])
     elif stage == "spec":
-        (d / "spec.md").write_text("# Spec\n\nAdd one file.\n")
+        (d / "spec.md").write_text("# Spec\n\n## Acceptance criteria\n1. The file exists.\n")
         sh(BIN / "job", "advance", jid, "build")
     elif stage == "build":
         marker = out / f"hung-{jid}"
@@ -131,7 +131,9 @@ while True:
         sh(BIN / "job", "advance", jid, "review")
     elif stage == "review":
         for r in job["agents"]["reviewers"]:
-            (d / f"round-{job['round']}" / f"review-{r}.md").write_text("VERDICT: PASS\n\nFine.\n")
+            (d / f"round-{job['round']}" / f"review-{r}.md").write_text(
+                "VERDICT: PASS\n\n## Criteria\n1. PASS — the file is in the diff\n"
+                + ("\n## Untested criteria\nNone.\n" if r == "spec" else ""))
         sh(BIN / "job", "advance", jid, "approve")
     elif stage == "approve":
         if os.environ.get("FAKE_ORCH_ESCALATE"):

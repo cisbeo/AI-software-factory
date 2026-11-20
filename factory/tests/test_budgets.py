@@ -19,7 +19,7 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from helpers import FactoryCase, write
+from helpers import SPEC_MD, review_md, FactoryCase, write
 
 JOB = "001-test"
 EXITS = {"success", "failure", "timeout", "budget", "human"}
@@ -59,7 +59,9 @@ class BudgetCase(FactoryCase):
 
     def reviews(self, rnd=1, **verdicts):
         for r, v in verdicts.items():
-            write(self.jobs / JOB / f"round-{rnd}" / f"review-{r}.md", f"VERDICT: {v}\n\n## Findings\n1. x\n")
+            write(self.jobs / JOB / f"round-{rnd}" / f"review-{r}.md",
+                  review_md(v, fail=(1,) if v == "CHANGES" else (), untested="none" if r == "spec" else None))
+        write(self.jobs / JOB / "spec.md", SPEC_MD)
 
     def advance(self, stage):
         return self.bin("job", "advance", JOB, stage)

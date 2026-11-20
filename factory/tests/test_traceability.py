@@ -15,7 +15,7 @@ import json
 import re
 import unittest
 
-from helpers import FACTORY_SRC, FactoryCase, write
+from helpers import FACTORY_SRC, SPEC_MD, FactoryCase, review_md, write
 
 JOB = "001-test"
 START = "<!-- factory:summary -->"
@@ -136,8 +136,9 @@ class Summary(FactoryCase):
         n, _ = self.world.mr(body="Closes #1")
         d = self.gate_job(n)
         self.assertEqual(self.bin("job", "advance", JOB, "review").returncode, 0)
-        write(d / "round-2" / "review-spec.md", "VERDICT: PASS\n")
-        write(d / "round-2" / "review-ux.md", "VERDICT: CHANGES\n")
+        write(d / "spec.md", SPEC_MD)
+        write(d / "round-2" / "review-spec.md", review_md("PASS", untested=[2]))
+        write(d / "round-2" / "review-ux.md", review_md("CHANGES", fail=(3,)))
         res = self.bin("job", "advance", JOB, "build")
         self.assertEqual(res.returncode, 0, res.stderr)
         body = self.body(n)
