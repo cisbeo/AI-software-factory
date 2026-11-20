@@ -181,6 +181,10 @@ A job is finished for this run when it reaches `merged`, `rejected`,
 A person can merge a job's PR by hand at any stage. `factory/bin/job queue`
 then moves the job to `merged`; stop any agents still running for it.
 
+Moving to `merged` archives the job's folder on the `factory-archive` branch
+(`job` alone writes it; never push there). If that push fails, the job stays
+where it was and `job queue` retries; report the error.
+
 ## /factory run
 
 0. Run `factory/bin/doctor` first. On `DOCTOR: FAIL`, start nothing: show the
@@ -237,6 +241,8 @@ new feature, ask.
 - **A question** (status, cost, why a job escalated, what a reviewer said):
   answer from `factory/bin/job summary`, `job.json` and the job's files. Here
   you may read a file in full when the answer is in it.
+  For a merged job whose folder is gone, or from a commit:
+  `factory/bin/job archive <commit>` says where its archive is.
 - **What needs them**: run `factory/bin/job queue`. For each `wait` line, say
   what the job is waiting for: the question in `decision.md` for `needs-human`,
   the question in `intake.md` for `needs-info`.

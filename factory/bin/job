@@ -26,6 +26,10 @@ Usage:
   job trailers <job> --agent A --model M
                                  the trailers an agent commit of this job carries (spec §9):
                                  Factory-Job, Factory-Agent, Factory-Model, Factory-Version
+  job archive <commit>           where the archive of the job that made <commit> is (its
+                                 Factory-Job trailer, or its second parent's for a forge merge)
+  job purge                      delete raw logs older than config `raw_log_retention_days`
+                                 (`job queue` does it too)
 
 <job> is a job id (004-dark-mode) or an issue number (12).
 
@@ -51,6 +55,14 @@ Traceability (spec §9). On every transition of a job that has a merge
 request, `job` rewrites the factory block of its body (between
 `<!-- factory:summary -->` markers): version, routing reason, retry budget
 spent, cost, and the gate and review verdicts of each round.
+
+Archive (spec §9, form decided in #1). Moving to merged commits the job's
+synthesis files (job.json, trace.jsonl, intake, spec, build, decision,
+feedback, and each round's gate and review verdicts) to jobs/<job-id>/ of the
+orphan branch config `archive_branch` on origin, after the secret detector
+masked what it found; ARCHIVE.md lists the masks and the files left out. Raw
+logs (round-N/*.log) and transcripts stay on the workstation. If the push
+fails, the job doesn't move to merged; `job queue` retries.
 """
 
 import fcntl
@@ -652,6 +664,7 @@ def advance(job, stage):
 
     if stage == "merged":
         require(job["pr"] and pr_state(job) == "merged", "the PR isn't merged")
+        archive_branch(), retention_days()  # refuse a bad config before any side effect
         if old == "needs-human":
             label(job["issue"], remove=LABELS["needs_human"])
 
@@ -783,7 +796,13 @@ def advance(job, stage):
         next_round(job)
         label(job["issue"], remove=LABELS["needs_human"])
 
-    return enter(job, old, stage, exit_kind)
+    job = enter(job, old, stage, exit_kind)
+    if stage == "merged":
+        # Refused when the push fails: the job stays where it was, the next
+        # `job queue` sees the merged PR and archives it again.
+        commit = archive(job)
+        job["archive"] = {"branch": archive_branch(), "path": f"jobs/{job['id']}/", "commit": commit}
+    return job
 
 
 def enter(job, old, stage, exit_kind=None):
@@ -906,6 +925,185 @@ def update_summary(job):
     forge("mr", "edit", job["pr"], "--body", f"{body}\n\n{summary_block(job)}\n".lstrip("\n"))
 
 
+# ---- Archive (spec §9, decided in #1) --------------------------------------
+
+# What a merged job leaves on the archive branch: its synthesis files only. Raw
+# logs (round-N/*.log) and Claude Code transcripts stay on the workstation, for
+# config `raw_log_retention_days`.
+ARCHIVED = re.compile(r"(job\.json|trace\.jsonl|(intake(-\d+)?|spec|build|decision|rejection|feedback-\d+)\.md"
+                      r"|round-\d+/(checks|merge-checks|checks-inconclusive-\d+|review-[a-z]+)\.md)")
+# The secret detector run on every archived file: what it finds is masked,
+# and ARCHIVE.md lists each mask (file, line, rule), never the value.
+SECRET_RULES = [
+    ("private-key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S)),
+    ("aws-access-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("github-token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})")),
+    ("gitlab-token", re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}")),
+    ("anthropic-key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}")),
+    ("openai-key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}")),
+    ("stripe-key", re.compile(r"\b[sr]k_live_[A-Za-z0-9]{20,}")),
+    ("slack-token", re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}")),
+    ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
+    ("url-credentials", re.compile(r"://[^/\s:@]+:(?P<v>[^/\s@]{3,})@")),
+    ("assigned-secret", re.compile(r"(?i)\b(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)[\"']?"
+                                   r"[ \t]{0,3}[:=][ \t]{0,3}(?P<v>[\"']?[A-Za-z0-9_+/=.~-]{12,}[\"']?)")),
+]
+
+
+def mask_secrets(text):
+    """(text with every secret replaced by [REDACTED:<rule>], [(line, rule)])."""
+    found = []
+    for rule, pattern in SECRET_RULES:
+        def mask(m, rule=rule):
+            # A rule with a `v` group masks the value only, not the key naming it.
+            start, end = m.span("v") if "v" in m.re.groupindex else m.span()
+            found.append((text.count("\n", 0, start) + 1, rule))
+            return m.group()[:start - m.start()] + f"[REDACTED:{rule}]" + m.group()[end - m.start():]
+        text = pattern.sub(mask, text)
+    return text, sorted(found)
+
+
+def archive_branch():
+    value = CONFIG.get("archive_branch")
+    require(isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", value) and value != BASE,
+            f"config.json: archive_branch is {value!r}, expected a branch name other than {BASE}")
+    return value
+
+
+def retention_days():
+    value = CONFIG.get("raw_log_retention_days")
+    require(is_number(value, integer=True) and value > 0,
+            f"config.json: raw_log_retention_days is {value!r}, expected a positive integer")
+    return value
+
+
+def archive_files(job):
+    """{path under jobs/<id>/: bytes} of the archive, masked, with ARCHIVE.md."""
+    d = job_dir(job["id"])
+    files, masks, left = {}, [], []
+    for path in sorted(p for p in d.rglob("*") if p.is_file()):
+        rel = path.relative_to(d).as_posix()
+        if not ARCHIVED.fullmatch(rel):
+            left.append(rel)
+            continue
+        if rel == "job.json":
+            text = json.dumps(job, indent=2) + "\n"  # the state being saved, not the one on disk
+        else:
+            text = path.read_text(errors="replace")
+        text, found = mask_secrets(text)
+        masks += [f"- {rel}:{line}: {rule}" for line, rule in found]
+        files[rel] = text.encode()
+    files["ARCHIVE.md"] = "\n".join([
+        f"# Archive of job {job['id']}",
+        "",
+        f"Issue #{job['issue']}: {job['title']}. Merge request #{job['pr']}, merged {job['ended']}.",
+        "",
+        "Synthesis files only (decision of #1). Raw logs and transcripts stay on the workstation",
+        f"for {retention_days()} days (config `raw_log_retention_days`).",
+        "",
+        "## Masked by the secret detector",
+        "",
+        *(masks or ["None."]),
+        "",
+        "## Left on the workstation",
+        "",
+        *([f"- {rel}" for rel in left if rel != ".lock"] or ["None."]),
+        "",
+    ]).encode()
+    return files
+
+
+def plumbing(*args, env=None, stdin=None):
+    res = subprocess.run(["git", *args], cwd=REPO, capture_output=True, env=env,
+                         input=stdin.encode() if isinstance(stdin, str) else stdin)
+    if res.returncode != 0:
+        raise Refused(f"archive: `git {' '.join(args)}` failed: {res.stderr.decode(errors='replace').strip()}")
+    return res.stdout.decode().strip()
+
+
+def archive(job):
+    """Commit the job's folder to jobs/<id>/ of the archive branch on origin,
+    without touching any checkout: plumbing on a throwaway index. Rerunning it
+    replaces the folder; an unchanged folder makes no commit."""
+    branch, prefix = archive_branch(), f"jobs/{job['id']}"
+    files = archive_files(job)
+    remote = f"refs/remotes/origin/{branch}"
+    for _ in range(2):  # the push loses a race once: fetch and rebuild
+        subprocess.run(["git", "fetch", "-q", "origin", f"refs/heads/{branch}:{remote}"],
+                       cwd=REPO, capture_output=True)
+        parent = subprocess.run(["git", "rev-parse", "-q", "--verify", f"{remote}^{{commit}}"],
+                                cwd=REPO, capture_output=True, text=True).stdout.strip()
+        index = job_dir(job["id"]) / ".archive-index"
+        index.unlink(missing_ok=True)
+        env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+        try:
+            plumbing("read-tree", *([parent] if parent else ["--empty"]), env=env)
+            plumbing("rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", prefix, env=env)
+            entries = "".join(f"100644 {plumbing('hash-object', '-w', '--stdin', stdin=data)}\t{prefix}/{rel}\n"
+                              for rel, data in files.items())
+            plumbing("update-index", "--add", "--index-info", env=env, stdin=entries)
+            tree = plumbing("write-tree", env=env)
+        finally:
+            index.unlink(missing_ok=True)
+        if parent and plumbing("rev-parse", f"{parent}^{{tree}}") == tree:
+            return parent
+        message = (f"Archive {job['id']} (merge request #{job['pr']}, issue #{job['issue']})\n\n"
+                   f"{trailer_text(job, SCRIPT_AGENT, 'none')}\n")
+        commit = plumbing("commit-tree", tree, *(["-p", parent] if parent else []), stdin=message)
+        pushed = subprocess.run(["git", "push", "-q", "origin", f"{commit}:refs/heads/{branch}"],
+                                cwd=REPO, capture_output=True, text=True)
+        if pushed.returncode == 0:
+            subprocess.run(["git", "update-ref", remote, commit], cwd=REPO, capture_output=True)
+            return commit
+    raise Refused(f"archive: pushing {branch} to origin failed: {pushed.stderr.strip()}")
+
+
+def purge_raw_logs():
+    """Delete the raw logs of factory/jobs/ older than config `raw_log_retention_days`."""
+    cutoff = datetime.now(timezone.utc).timestamp() - retention_days() * 86400
+    removed = []
+    for path in sorted(JOBS.glob("*/round-*/*.log")) if JOBS.exists() else []:
+        if path.stat().st_mtime < cutoff:
+            path.unlink()
+            removed.append(path.relative_to(JOBS).as_posix())
+    return removed
+
+
+def cmd_archive(rev):
+    """Print where the archive of the job that produced commit <rev> is."""
+    res = subprocess.run(["git", "rev-parse", "--verify", "-q", f"{rev}^{{commit}}"],
+                         cwd=REPO, capture_output=True, text=True)
+    if res.returncode != 0 or rev.startswith("-"):
+        die(f"{rev!r} isn't a commit of this repository")
+    commit = res.stdout.strip()
+    # A merge request merged on the forge: its merge commit carries no trailers,
+    # its second parent (the job branch tip) does.
+    candidates = [commit] + plumbing("rev-list", "--parents", "-n", "1", commit).split()[2:]
+    job_id = None
+    for c in candidates:
+        found = plumbing("log", "-1", "--format=%(trailers:key=Factory-Job,valueonly,separator=%x2C)", c)
+        ids = {v.strip() for v in found.split(",") if v.strip()}
+        if len(ids) > 1:
+            die(f"{c[:7]} names several jobs: {', '.join(sorted(ids))}")
+        if ids:
+            job_id = ids.pop()
+            break
+    if not job_id or not re.fullmatch(r"\d{3}-[a-z0-9-]+", job_id):
+        die(f"{commit[:7]} has no valid Factory-Job trailer: no factory job made it")
+    branch = archive_branch()
+    remote = f"refs/remotes/origin/{branch}"
+    subprocess.run(["git", "fetch", "-q", "origin", f"refs/heads/{branch}:{remote}"], cwd=REPO, capture_output=True)
+    listed = subprocess.run(["git", "ls-tree", "-r", "--name-only", remote, "--", f"jobs/{job_id}/"],
+                            cwd=REPO, capture_output=True, text=True)
+    if listed.returncode != 0 or not listed.stdout.strip():
+        die(f"job {job_id} (from {commit[:7]}) has no archive on origin/{branch}")
+    print(f"Job: {job_id}\nArchive: origin/{branch}:jobs/{job_id}/")
+    for name in listed.stdout.split():
+        print(f"  {name.removeprefix(f'jobs/{job_id}/')}")
+    print(f"Read a file: git show origin/{branch}:jobs/{job_id}/decision.md")
+
+
 def cmd_trailers(job, args):
     if len(args) != 4 or args[0] != "--agent" or args[2] != "--model":
         die("usage: job trailers <job> --agent A --model M")
@@ -1007,6 +1205,7 @@ def cmd_queue():
     concurrency slots; the rest show as `hold` until a running job finishes.
     A new issue with an open blocker is `blocked` and takes no slot; the next
     `queue`, after the blocker is closed, lets it through."""
+    purge_raw_logs()
     jobs = {j["issue"]: j for j in all_jobs()}
     # A job is done once its PR is merged on the forge, which also closes the issue.
     for j in jobs.values():
@@ -1211,6 +1410,11 @@ def main(argv):
             print(f"{job['id']}: {job['stage']} round {job['round']} gate {job['gate'] or '-'} {reviews}".rstrip())
         elif cmd == "summary":
             cmd_summary(args)
+        elif cmd == "archive" and len(args) == 1:
+            cmd_archive(args[0])
+        elif cmd == "purge" and not args:
+            for rel in purge_raw_logs():
+                print(f"removed factory/jobs/{rel}")
         elif cmd == "trailers" and len(args) >= 1:
             cmd_trailers(resolve(args[0]), args[1:])
         else:

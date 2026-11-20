@@ -15,6 +15,7 @@ Ce fichier est une table des matières. La référence fait foi.
 ## Code
 
 - `factory/bin/job` — seul écrivain de l'état des jobs (`factory/jobs/`, ignoré par git).
+- Archive (§9) : à la fusion, `job` pousse le dossier du job, secrets masqués, sur la branche orpheline `factory-archive` ; `factory/bin/job archive <commit>` la retrouve. Journaux bruts : rétention `raw_log_retention_days` (30 jours).
 - `factory/bin/gate`, `factory/bin/route` — gate déterministe et routage des reviewers.
 - `factory/checks.sh` — contrôles du dépôt cible ; modèle vide à configurer.
 - `.claude/settings.json`, `.claude/hooks/guard.py` — règles de refus des secrets et hook PreToolUse qui bloque les commandes destructrices (§8).

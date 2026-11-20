@@ -12,6 +12,8 @@ Always blocked:
   checkout -B, filter-branch, filter-repo, replace, update-ref, reflog expire;
 - force push (-f, --force*, +refspec, --delete, :refspec, --mirror, --prune);
 - push to the base branch (factory/config.json `base_branch`), or of every branch;
+- push to the archive branch (factory/config.json `archive_branch`): only
+  factory/bin/job writes it, after the secret detector (spec §9);
 - from a job worktree (.worktrees/<job-id>, or a factory/* branch), push of
   anything but factory/<job-id>;
 - recursive delete (rm -r, find -delete, find -exec rm) outside the git
@@ -239,6 +241,9 @@ def check_push(cwd, opts, args, ctx):
         dsts.append("--tags")
 
     require(base not in dsts, f"git push to the base branch {base}; blocked: merges go through the forge (spec §8)")
+    archive = ctx["archive"]()
+    require(archive not in dsts, f"git push to the archive branch {archive}; blocked: only factory/bin/job "
+                                 "writes it, after the secret detector (spec §9)")
     job = f"factory/{Path(top).name}" if Path(top).parent.name == ".worktrees" else (
         current if current and current.startswith("factory/") else None)
     if job:
@@ -470,15 +475,16 @@ def check(payload, lens):
         lens = agent[len("reviewer-"):]
         require(lens in LENSES, f"{agent} has no read-only rules in guard.py; blocked")
 
-    def base():
+    def branch_setting(key):
         try:
-            value = json.loads((project / "factory" / "config.json").read_text())["base_branch"]
+            value = json.loads((project / "factory" / "config.json").read_text())[key]
         except (OSError, TypeError, ValueError, KeyError) as e:
-            raise Block(f"can't read base_branch from factory/config.json ({e}); push blocked")
-        require(isinstance(value, str) and value, "factory/config.json base_branch is empty; push blocked")
+            raise Block(f"can't read {key} from factory/config.json ({e}); push blocked")
+        require(isinstance(value, str) and value, f"factory/config.json {key} is empty; push blocked")
         return value
 
-    ctx = {"project": project, "base": base, "lens": lens}
+    ctx = {"project": project, "base": lambda: branch_setting("base_branch"),
+           "archive": lambda: branch_setting("archive_branch"), "lens": lens}
 
     if tool == "Bash":
         command = tool_input.get("command")
