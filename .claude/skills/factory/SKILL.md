@@ -48,8 +48,10 @@ Every stop records one of five exits in `job.json` `exit`: `success`,
 `<repo>` is the main checkout (`git rev-parse --show-toplevel` from your
 session). It stays the user's: you and the agents never change it except
 through the scripts. `factory/jobs/` is gitignored runtime state.
-Installing, reinstalling or uninstalling the factory (`factory/bin/factory
-install|uninstall`) is the user's to run, never yours.
+Installing, reinstalling, verifying or uninstalling the factory
+(`factory/bin/factory install|verify|uninstall`) is the user's to run, never
+yours. `factory verify` runs `/factory run <n>` on its own tickets (titles
+starting `factory verify :`): treat them like any other.
 
 ```
 <repo>/factory/config.json                     concurrency, budgets, caps, labels, routing, prices

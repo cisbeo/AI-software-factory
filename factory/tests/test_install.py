@@ -125,9 +125,13 @@ class InstallCase(unittest.TestCase):
     def install(self, *args, stdin=""):
         return self.factory("install", *args, stdin=stdin)
 
-    def ok(self, res, word="INSTALL: OK"):
+    def ok(self, res, word=None):
+        """Exit 0 and `word`; by default, an install posed (never OK before verify) or a dry run."""
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-        self.assertIn(word, res.stdout)
+        if word is None:
+            self.assertRegex(res.stdout, r"INSTALL: (POSÉE — pas encore vérifiée|OK \(à blanc, rien d'écrit\))")
+        else:
+            self.assertIn(word, res.stdout)
         self.assertNotIn("Traceback", res.stderr)
         return res
 
@@ -400,6 +404,12 @@ class Install(InstallCase):
     def setUp(self):
         super().setUp()
         self.make_target()
+
+    def test_install_is_not_declared_successful_before_verify(self):
+        res = self.ok(self.install(*self.answered()))
+        self.assertNotIn("INSTALL: OK", res.stdout)
+        self.assertIn("pas encore vérifiée", res.stdout)
+        self.assertIn("factory verify", res.stdout)
 
     def test_install_poses_the_components_of_the_chosen_forge(self):
         res = self.ok(self.install(*self.answered()))

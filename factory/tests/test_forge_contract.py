@@ -147,6 +147,10 @@ class FakeWorld:
     def labels(self, n):
         return {l["name"] for l in self.load()["issues"][str(n)]["labels"]}
 
+    def ticket_state(self, n):
+        issue = self.load()["issues"][str(n)]
+        return issue["state"], issue.get("state_reason")
+
     def comments(self, n):
         return [c["body"] for c in self.load()["comments"].get(str(n), [])]
 
@@ -270,6 +274,10 @@ class LiveWorld:
 
     def labels(self, n):
         return {l["name"] for l in self.api(self.r(f"issues/{n}"))["labels"]}
+
+    def ticket_state(self, n):
+        issue = self.api(self.r(f"issues/{n}"))
+        return issue["state"], issue.get("state_reason")
 
     def comments(self, n):
         return [c["body"] for c in self.api(self.r(f"issues/{n}/comments"))]
@@ -513,6 +521,19 @@ class ForgeContract(unittest.TestCase):
         self.assertTrue(out["url"].startswith("https://"))
         t = self.forge_json("ticket", "view", str(out["number"]))
         self.assertEqual((t["title"], t["body"], t["labels"]), ("New", "Text", [self.label]))
+
+    def test_ticket_close_as_not_planned(self):
+        n = self.world.ticket("T", labels=[self.label])
+        self.forge_ok("ticket", "close", str(n))
+        self.assertEqual(self.world.ticket_state(n), ("closed", "not_planned"))
+        # Closed as not planned, its work wasn't done: it still blocks.
+        m = self.world.ticket("U", body=f"Bloqué par #{n}")
+        if self.world.live:
+            self.addCleanup(self.world.close, m)
+        self.assertEqual(self.forge_json("blockers", str(m)), [n])
+
+    def test_ticket_close_of_a_missing_ticket_fails_cleanly(self):
+        self.forge_fails("ticket", "close", "99999")
 
     # ---- merge requests -----------------------------------------------------
 
