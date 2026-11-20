@@ -325,6 +325,7 @@ class FiveExits(BudgetCase):
         self.assertEqual(self.read_job(JOB)["exit"], "failure")
 
     def test_merged_is_success(self):
+        self.use_origin()  # the merged job is archived there
         n, head = self.world.mr()
         self.world.edit(lambda s: s["pulls"][str(n)].update(merged=True, state="closed"))
         self.job(stage="review", round=1, pr=n)

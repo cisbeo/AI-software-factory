@@ -134,6 +134,18 @@ class FactoryCase(unittest.TestCase):
         self.env.pop("FORGE_REPO", None)
         return world
 
+    def use_origin(self):
+        """Make the temporary root a checkout on main of a bare origin.git."""
+        self.origin = self.tmp / "origin.git"
+        self.git(self.tmp, "init", "--bare", "-q", str(self.origin))
+        write(self.root / ".gitignore", "/factory/jobs/\n/.worktrees/\n")
+        self.git(self.root, "init", "-q")
+        self.git(self.root, "add", "-A")
+        self.git(self.root, "commit", "-q", "-m", "base")
+        self.git(self.root, "remote", "add", "origin", str(self.origin))
+        self.git(self.root, "push", "-q", "origin", "HEAD:main")
+        return self.origin
+
     def gh_calls(self):
         log = self.tmp / "world" / "gh.log"
         return [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []

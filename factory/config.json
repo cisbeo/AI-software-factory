@@ -9,6 +9,8 @@
   "max_file_lines": 1500,
   "max_file_bytes": 500000,
   "auto_merge": "never",
+  "archive_branch": "factory-archive",
+  "raw_log_retention_days": 30,
   "labels": {
     "queue": "factory",
     "needs_info": "factory:needs-info",
