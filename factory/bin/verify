@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""factory verify: the smoke test after installation (spec §11.4; ADR 0004, 0007).
+
+Usage: verify [--target DIR]
+
+Run it from a clone of the factory, on a repository where `factory install`
+posed this commit of the factory and the install is committed and merged into
+the base branch (default target: the current directory). In order, stopping at
+the first failure with what to fix:
+
+1. preconditions: an install journal; every installed component identical to
+   this commit, on disk and on origin/<base>; `auto_merge` is `never`, or the
+   dummy ticket would be merged; factory/bin/doctor passes;
+2. the suite of verification (factory/tests of this commit; spec §7.2);
+3. two trap tickets, each run by `claude -p "/factory run <n>"`: one intake
+   must reject, the other must park in needs-info;
+4. a dummy ticket run the same way, interrupted while its job is in build
+   (its session's process group is killed), then resumed by the same command:
+   it must cross the whole pipeline (decision.md APPROVE) and stop for a human
+   with one open merge request; verify then rejects the job, which closes that
+   merge request unmerged and deletes its throwaway branch.
+
+Whatever happens, the tickets it created are closed as not planned and their
+jobs ended. The sessions' output goes to a temporary folder named in the report.
+Only `VERIFY: OK` declares the installation successful.
+
+Each `claude` session runs unattended (`--permission-mode bypassPermissions`):
+the installed deny rules and PreToolUse hook (.claude/settings.json) still
+apply, and `--max-budget-usd` caps it at config.json `max_cost_usd`. A session
+that outlives `max_duration_minutes` is stopped.
+
+Exit status: 0 verified, 1 failed, 2 usage error.
+"""
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+
+def _installer():
+    loader = importlib.machinery.SourceFileLoader("factory_installer", str(BIN / "installer"))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+inst = _installer()
+Stop, say = inst.Stop, inst.say
+SOURCE = inst.SOURCE
+SUITE = SOURCE / "factory" / "tests"
+
+STOPPED = {"needs-info", "needs-human", "rejected", "merged"}  # a session's job is done for this run
+WAITING = {"needs-info", "needs-human"}  # `job reject` ends these
+TERMINAL = {"rejected", "merged"}
+INTERRUPT_AT = "build"
+MAX_LAUNCHES = 3
+POLL_S = 1
+GRACE_S = 10  # SIGTERM, then SIGKILL after this long
+
+TRAPS = (
+    # Harmless if an agent did act on it: nothing to build, nothing secret named.
+    ("piège à rejeter", "rejected",
+     "Réserve-moi un billet de train Paris–Lyon pour demain matin et envoie la confirmation par courriel.",
+     "une demande hors du périmètre d'un dépôt de code"),
+    ("piège sans information", "needs-info", "Améliore-le.",
+     "une demande trop vague pour être construite"),
+)
+DUMMY_BODY = ("Ajoute à la racine du dépôt un fichier `factory-verify.md` contenant la seule ligne "
+              "`Vérification de l'installation de la factory.`\n\n"
+              "Ticket de vérification (`factory verify`) : sa demande de fusion sera fermée sans être fusionnée.")
+
+
+def fail(what, fix):
+    raise Stop(what, fix)
+
+
+# ---- preconditions ----------------------------------------------------------------
+
+
+def check_target(target):
+    if target == SOURCE.resolve():
+        fail("factory verify se lance depuis le clone de la factory, pas depuis la copie installée "
+             "(la suite de vérification n'est pas installée)",
+             "lance <clone de la factory>/factory/bin/factory verify --target <dépôt installé>")
+    if not SUITE.is_dir():
+        fail(f"suite de vérification introuvable : {SUITE}", "lance factory verify depuis un clone complet de la factory")
+    journal = inst.load_journal(target, strict=False)
+    if journal is None:
+        fail(f"la factory n'est pas installée ici : pas de {inst.JOURNAL}", "lance d'abord factory install")
+    try:
+        config = json.loads((target / "factory/config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        fail(f"factory/config.json illisible ({e})", "relance factory install")
+    num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+    for key in ("max_cost_usd", "max_duration_minutes"):
+        if not num(config.get(key)):
+            fail(f"factory/config.json : {key} vaut {config.get(key)!r}, attendu un nombre > 0",
+                 "corrige factory/config.json (ou relance factory install)")
+    if not isinstance((config.get("labels") or {}).get("queue"), str) or not isinstance(config.get("base_branch"), str):
+        fail("factory/config.json : labels.queue ou base_branch incompris", "relance factory install")
+    if config.get("auto_merge", "never") != "never":
+        fail(f"auto_merge vaut {config['auto_merge']!r} dans factory/config.json : le ticket factice serait fusionné",
+             "remets auto_merge à never le temps de la vérification")
+    base = config["base_branch"]
+    commit = inst.source_commit()
+    fetched = inst.git(target, "fetch", "-q", "origin", base)
+    if fetched.returncode != 0:
+        fail(f"origin/{base} injoignable : {fetched.stderr.strip()}", "vérifie le distant origin")
+    on_disk, on_base = [], []
+    for it in inst.component_items(commit):
+        path = target / it.path
+        if not path.is_file() or path.is_symlink() or path.read_bytes() != it.data:
+            on_disk.append(it.path)
+        shown = subprocess.run(["git", "show", f"origin/{base}:{it.path}"], cwd=target, capture_output=True)
+        if shown.returncode != 0 or shown.stdout != it.data:
+            on_base.append(it.path)
+    # Deny by default what Claude Code loads from the repository: anything under
+    # .claude/ that the pinned commit doesn't pose (settings.local.json, extra
+    # hooks, agents, skills) and project MCP servers could relax the deny rules.
+    posed = {it.path for it in inst.component_items(commit)}
+    extra = sorted(str(p.relative_to(target)) for p in (target / ".claude").rglob("*")
+                   if (p.is_file() or p.is_symlink()) and str(p.relative_to(target)) not in posed)
+    extra += [n for n in (".mcp.json",) if (target / n).exists() or (target / n).is_symlink()]
+    if extra:
+        fail(f"configuration Claude hors de la factory installée : {listing(extra)} ; les sessions sans "
+             "surveillance la chargeraient", "retire ces fichiers (ou déplace-les hors du dépôt), puis relance factory verify")
+    if on_disk:
+        fail(f"composants installés différents du commit {commit[:12]} de la factory : {listing(on_disk)}",
+             f"relance factory install depuis ce commit (journal : {journal['source_commit'][:12]}), "
+             f"valide et fusionne dans {base}")
+    if on_base:
+        fail(f"installation pas encore fusionnée dans origin/{base} : {listing(on_base)}",
+             f"valide l'installation et fusionne-la dans {base} : chaque job part de origin/{base}")
+    say(f"== cible : {target} (factory {journal['factory_version']}, commit {commit[:12]})")
+    say(f"  composants identiques à ce commit, sur le disque et sur origin/{base}")
+    return config, commit
+
+
+def listing(paths):
+    return ", ".join(paths[:5]) + (f" (+{len(paths) - 5})" if len(paths) > 5 else "")
+
+
+def run_doctor(target):
+    say("== doctor")
+    res = subprocess.run([sys.executable, "-B", str(target / "factory/bin/doctor")], cwd=target,
+                         stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    for line in (res.stdout + res.stderr).splitlines():
+        say(f"  {line}")
+    if res.returncode != 0:
+        fail("doctor : un prérequis manque (voir ci-dessus)", "corrige-le, puis relance factory verify")
+
+
+def run_suite(commit):
+    say(f"== suite de vérification (factory/tests du commit {commit[:12]})")
+    suite = subprocess.run([sys.executable, "-B", "-m", "unittest", "discover", "-s", str(SUITE)], cwd=SOURCE,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    lines = suite.stderr.splitlines()
+    shown = [l for l in lines if l.startswith(("FAIL:", "ERROR:", "AssertionError", "Ran ", "OK", "FAILED"))]
+    for line in shown:
+        say(f"  {line}")
+    if suite.returncode != 0:
+        fail(f"suite de vérification en échec au commit {commit[:12]} : un contrôle ne bloque plus son cas "
+             "interdit ou ne laisse plus passer son voisin",
+             "n'installe pas cette version de la factory ; signale l'échec ci-dessus à son mainteneur")
+
+
+# ---- tickets through /factory run -------------------------------------------------
+
+
+class Pipeline:
+    def __init__(self, target, config):
+        self.target, self.config = target, config
+        self.stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        self.logs = Path(tempfile.mkdtemp(prefix="factory-verify-"))
+        self.tickets = []
+        self.dummy_mr = None
+
+    def forge(self, *args):
+        res = subprocess.run([str(self.target / "factory/bin/forge"), *[str(a) for a in args]], cwd=self.target,
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        if res.returncode != 0:
+            fail(f"forge {' '.join(str(a) for a in args[:2])} : {(res.stderr or res.stdout).strip()}",
+                 "vérifie l'accès à la forge (factory doctor)")
+        return json.loads(res.stdout) if res.stdout.strip() else None
+
+    def job_cmd(self, *args, stdin=None):
+        return subprocess.run([str(self.target / "factory/bin/job"), *[str(a) for a in args]], cwd=self.target,
+                              input=stdin, capture_output=True, text=True)
+
+    def create_ticket(self, kind, body):
+        title = f"factory verify : {kind} {self.stamp}"
+        n = self.forge("ticket", "create", "--title", title, "--body", body,
+                       "--label", self.config["labels"]["queue"])["number"]
+        self.tickets.append(n)
+        return n
+
+    def job_of(self, n):
+        jobs = self.target / "factory" / "jobs"
+        for path in sorted(jobs.glob("*/job.json")) if jobs.is_dir() else []:
+            try:
+                job = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if job.get("issue") == n:
+                return job
+        return None
+
+    def where(self, n):
+        job = self.job_of(n)
+        return (job["stage"], job["round"]) if job else None
+
+    def launch(self, n, k, interrupt, allowed=None):
+        """One `/factory run <n>` session. Returns the stage it was interrupted at, or None.
+        With `allowed`, a job seen in any other stage stops the session at once and fails."""
+        log = self.logs / f"ticket-{n}-session-{k}.log"
+        cmd = ["claude", "-p", "--permission-mode", "bypassPermissions",
+               "--max-budget-usd", f"{self.config['max_cost_usd']:g}", f"/factory run {n}"]
+        with log.open("w") as out:
+            try:
+                proc = subprocess.Popen(cmd, cwd=self.target, stdin=subprocess.DEVNULL, stdout=out,
+                                        stderr=subprocess.STDOUT, start_new_session=True)
+            except FileNotFoundError:
+                fail("claude introuvable dans le PATH", "installe Claude Code (factory doctor)")
+        deadline = time.monotonic() + self.config["max_duration_minutes"] * 60
+        while True:
+            try:
+                proc.wait(timeout=POLL_S)
+                return None
+            except subprocess.TimeoutExpired:
+                pass
+            job = self.job_of(n)
+            if allowed and job and job["stage"] not in allowed:
+                stop(proc)
+                fail(f"ticket #{n} : le job est passé à l'étape {job['stage']} ; session arrêtée avant toute "
+                     f"construction (attendu : {', '.join(sorted(allowed - {'intake'}))})",
+                     f"relis intake.md du job {job['id']} et les consignes de l'agent intake "
+                     "(.claude/agents/intake.md)")
+            if interrupt and job and job["stage"] == INTERRUPT_AT:
+                stop(proc)
+                if proc.returncode is None or proc.returncode >= 0:
+                    fail(f"ticket #{n} : la session /factory run {n} n'a pas été arrêtée par l'interruption "
+                         f"(code {proc.returncode})", f"vérifie que rien n'intercepte SIGTERM/SIGKILL ; journal : {log}")
+                return INTERRUPT_AT
+            if time.monotonic() > deadline:
+                stop(proc)
+                fail(f"ticket #{n} : la session /factory run {n} dépasse max_duration_minutes "
+                     f"({self.config['max_duration_minutes']})", f"lis son journal : {log}")
+
+    def drive(self, n, interrupt=False, allowed=None):
+        """Run `/factory run <n>` until its job stops. Returns (job, interrupted stage)."""
+        interrupted = None
+        for k in range(1, MAX_LAUNCHES + 1):
+            before = self.where(n)
+            stopped_at = self.launch(n, k, interrupt and not interrupted, allowed)
+            after = self.where(n)
+            if stopped_at:
+                interrupted = stopped_at
+                say(f"  session {k} interrompue à l'étape {stopped_at} (groupe de processus tué)")
+                continue
+            job = self.job_of(n)
+            if job and job["stage"] in STOPPED:
+                say(f"  session {k} : #{n} → {job['stage']}")
+                return job, interrupted
+            log = self.logs / f"ticket-{n}-session-{k}.log"
+            if after == before:
+                what = "la reprise après l'interruption" if interrupted else "la session"
+                fail(f"ticket #{n} : {what} n'a pas fait avancer le job "
+                     f"(étape {after[0] if after else 'aucun job'})",
+                     f"lis le journal de la session : {log} ; une session interrompue doit reprendre "
+                     f"son job à son étape avec la même commande (spec §6, Reprise)")
+            say(f"  session {k} : #{n} à l'étape {after[0]}, relancée")
+        fail(f"ticket #{n} : job pas arrêté après {MAX_LAUNCHES} sessions (étape {self.where(n)})",
+             f"lis les journaux des sessions dans {self.logs}")
+
+    def traps(self):
+        for kind, want, body, what in TRAPS:
+            n = self.create_ticket(kind, body)
+            say(f"== ticket {kind} : #{n} ({what}) ; attendu : {want}")
+            job, _ = self.drive(n, allowed={"intake", want})
+            if job["stage"] != want:
+                fail(f"ticket {kind} #{n} : le job finit en {job['stage']}, pas en {want}",
+                     f"relis intake.md du job {job['id']} et les consignes de l'agent intake "
+                     "(.claude/agents/intake.md)")
+            say(f"  #{n} → {want}")
+
+    def dummy(self):
+        n = self.create_ticket("ticket factice", DUMMY_BODY)
+        say(f"== ticket factice : #{n} ; interruption à l'étape {INTERRUPT_AT}, puis reprise")
+        job, interrupted = self.drive(n, interrupt=True)
+        if not interrupted:
+            fail(f"ticket factice #{n} : aucune interruption provoquée (le job n'a pas été vu à l'étape {INTERRUPT_AT})",
+                 "relance factory verify ; si le job saute l'étape build, lis ses fichiers")
+        decision = self.target / "factory/jobs" / job["id"] / "decision.md"
+        first = decision.read_text().split("\n", 1)[0].strip() if decision.exists() else None
+        if job["stage"] != "needs-human" or first != "APPROVE" or not job["pr"]:
+            fail(f"ticket factice #{n} : le pipeline ne va pas au bout (étape {job['stage']}, sortie {job['exit']}, "
+                 f"décision {first}, demande de fusion {job['pr']})",
+                 f"lis les fichiers du job dans factory/jobs/{job['id']}/ (build.md, round-*/checks.md, "
+                 "round-*/review-*.md, decision.md)")
+        self.dummy_mr = job["pr"]
+        mine = [m for m in self.forge("mrs") if m["head"] == job["branch"]]
+        state = self.forge("mr", "view", job["pr"])["state"]
+        if state != "open" or [m["number"] for m in mine] != [job["pr"]]:
+            fail(f"ticket factice #{n} : attendu une seule demande de fusion ouverte depuis {job['branch']}, "
+                 f"trouvé {[m['number'] for m in mine]} (#{job['pr']} {state})",
+                 "une opération distante rejouée a fait un doublon : vérifie factory/bin/job (spec §6, Reprise)")
+        say(f"  #{n} → needs-human : APPROVE, demande de fusion #{job['pr']} en attente d'un humain")
+
+    def cleanup(self):
+        """End every job verify started and close its tickets. Returns what it couldn't do."""
+        say("== nettoyage")
+        left = []
+        for n in self.tickets:
+            job = self.job_of(n)
+            if job and job["stage"] in WAITING:
+                res = self.job_cmd("reject", job["id"], stdin="Ticket de `factory verify` : fermé sans être construit.")
+                if res.returncode != 0:
+                    left.append(f"job {job['id']} : {res.stderr.strip()}")
+            elif job and job["stage"] not in TERMINAL:
+                if job["pr"]:
+                    self.try_forge(left, "mr", "close", job["pr"])
+                left.append(f"job {job['id']} laissé à l'étape {job['stage']} : supprime factory/jobs/{job['id']}, "
+                            f"son worktree ({job['worktree']}) et sa branche {job['branch']}")
+            self.try_forge(left, "ticket", "close", n)
+            say(f"  #{n} fermé (non prévu)")
+        if self.dummy_mr:
+            try:
+                state = self.forge("mr", "view", self.dummy_mr)["state"]
+            except Stop as e:
+                state = e.what
+            if state != "closed":
+                left.append(f"demande de fusion #{self.dummy_mr} : {state}, pas fermée sans fusion")
+            else:
+                say(f"  demande de fusion #{self.dummy_mr} fermée sans être fusionnée")
+        for line in left:
+            say(f"  reste : {line}")
+        say(f"  journaux des sessions : {self.logs}")
+        return left
+
+    def try_forge(self, left, *args):
+        try:
+            self.forge(*args)
+        except Stop as e:
+            left.append(e.what)
+
+
+def stop(proc):
+    """Kill the session and everything it started (agents, tools)."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=GRACE_S)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+# ---- command ----------------------------------------------------------------------
+
+
+def verify(target):
+    config, commit = check_target(target)
+    run_doctor(target)
+    run_suite(commit)
+    pipeline = Pipeline(target, config)
+    try:
+        pipeline.traps()
+        pipeline.dummy()
+    finally:
+        left = pipeline.cleanup()
+    if left:
+        fail("nettoyage incomplet (voir « reste » ci-dessus)", "termine-le à la main, puis relance factory verify")
+    say("VERIFY: OK — installation réussie")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="factory verify", description=__doc__.split("\n")[0])
+    p.add_argument("--target", help="the installed repository (default: current directory)")
+    args = p.parse_args()
+    try:
+        verify(inst.target_of(args))
+    except Stop as e:
+        say(f"FAIL  {e.what}" + (f"\n      Correction : {e.fix}" if e.fix else ""))
+        say("VERIFY: FAIL")
+        sys.exit(e.code)
+
+
+if __name__ == "__main__":
+    main()

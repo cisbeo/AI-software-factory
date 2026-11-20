@@ -6,6 +6,7 @@ Usage:
   factory discover [options]              survey and questions; writes factory/answers.json (§11.2)
   factory install [--dry-run] [options]   applies the plan (§11.3)
   factory uninstall [--dry-run]           removes what install posed, from its journal (§11.3)
+  factory verify [--target DIR]           smoke test after install; the install succeeds only if it passes (§11.4)
   factory audit [--root DIR]              pins and agent tools (§8)
 
 `factory <command> --help` gives each command's options.
@@ -18,7 +19,7 @@ from pathlib import Path
 BIN = Path(__file__).resolve().parent
 COMMANDS = {"doctor": ["doctor"], "audit": ["audit"],
             "discover": ["installer", "discover"], "install": ["installer", "install"],
-            "uninstall": ["installer", "uninstall"]}
+            "uninstall": ["installer", "uninstall"], "verify": ["verify"]}
 
 
 def main():

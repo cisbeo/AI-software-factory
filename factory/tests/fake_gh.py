@@ -112,7 +112,7 @@ def route(state, method, path, query, payload):
         if method == "GET":
             return issue
         if method == "PATCH":
-            issue.update({k: v for k, v in payload.items() if k in ("state", "title", "body")})
+            issue.update({k: v for k, v in payload.items() if k in ("state", "state_reason", "title", "body")})
             return issue
     if mm := re.fullmatch(r"issues/(\d+)/comments", rest):
         issue_or_404(state, mm.group(1))

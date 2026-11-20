@@ -100,6 +100,22 @@ MUTATIONS = [
  ('installer: désinstallation à blanc qui retire', 'factory/bin/installer', 'if args.dry_run:\n        say("UNINSTALL: OK', 'if False:\n        say("UNINSTALL: OK', 'test_install.Uninstall'),
  ('forge: label existant recréé sans erreur', 'factory/bin/forge', 'if e.status == 422 and "already_exists" in str(e):', 'if False:', 'test_forge_contract'),
  ('doctor: --base ignoré', 'factory/bin/doctor', 'config.get("base_branch") if args.base is None else args.base', 'config.get("base_branch")', 'test_doctor.BaseBranch'),
+ ('forge: ticket fermé comme fait', 'factory/bin/forge', '{"state": "closed", "state_reason": "not_planned"}', '{"state": "closed", "state_reason": "completed"}', 'test_forge_contract'),
+ ('installer: installation déclarée réussie sans verify', 'factory/bin/installer', 'say("INSTALL: POSÉE — pas encore vérifiée")', 'say("INSTALL: OK")', 'test_install.Install.test_install_is_not_declared_successful_before_verify'),
+ ('forge: demande de fusion fermée comme ticket', 'factory/bin/forge', 'if "pull_request" in self.issue(number):', 'if False:', 'test_forge_contract'),
+ ('verify: configuration Claude étrangère acceptée', 'factory/bin/verify', '    if extra:\n        fail(f"configuration Claude', '    if False:\n        fail(f"configuration Claude', 'test_verify.Preconditions.test_claude_configuration_beyond_the_install_is_refused'),
+ ('verify: plafonds illisibles acceptés', 'factory/bin/verify', '        if not num(config.get(key)):', '        if False:', 'test_verify.Preconditions.test_caps_the_sessions_cannot_read_are_refused'),
+ ('verify: auto_merge autre que never accepté', 'factory/bin/verify', 'if config.get("auto_merge", "never") != "never":', 'if False:', 'test_verify.Preconditions.test_auto_merge_other_than_never_is_refused'),
+ ('verify: composant modifié accepté', 'factory/bin/verify', 'if not path.is_file() or path.is_symlink() or path.read_bytes() != it.data:', 'if False:', 'test_verify.Preconditions.test_a_component_changed_since_install_is_refused'),
+ ('verify: installation hors de la base acceptée', 'factory/bin/verify', 'if shown.returncode != 0 or shown.stdout != it.data:', 'if False:', 'test_verify.Preconditions.test_an_install_not_merged_into_the_base_branch_is_refused'),
+ ('verify: suite de vérification en échec ignorée', 'factory/bin/verify', 'if suite.returncode != 0:', 'if False:', 'test_verify.SuiteFails'),
+ ('verify: piège mal traité accepté', 'factory/bin/verify', 'if job["stage"] != want:', 'if False:', 'test_verify.Failures.test_a_trap_that_ends_in_the_wrong_waiting_stage_fails_verify'),
+ ('verify: piège laissé construire', 'factory/bin/verify', 'if allowed and job and job["stage"] not in allowed:', 'if False:', 'test_verify.Failures.test_a_trap_that_intake_accepts_fails_verify_and_is_cleaned_up'),
+ ('verify: pipeline incomplet accepté', 'factory/bin/verify', 'if job["stage"] != "needs-human" or first != "APPROVE" or not job["pr"]:', 'if False:', 'test_verify.Failures.test_a_dummy_ticket_that_stops_short_of_approval_fails_verify'),
+ ('verify: reprise sans progrès acceptée', 'factory/bin/verify', 'if after == before:', 'if False:', 'test_verify.Failures.test_a_resume_that_does_not_move_the_job_fails_verify'),
+ ("verify: interruption qui n'arrête pas la session", 'factory/bin/verify', 'os.killpg(proc.pid, sig)', 'pass', 'test_verify.Verify.test_an_interruption_mid_job_is_resumed_by_factory_run'),
+ ('verify: job en attente non terminé', 'factory/bin/verify', 'if job and job["stage"] in WAITING:', 'if False:', 'test_verify.Verify.test_the_dummy_ticket_crosses_the_pipeline_and_its_merge_request_is_closed_unmerged'),
+ ('verify: tickets laissés ouverts', 'factory/bin/verify', 'self.try_forge(left, "ticket", "close", n)', 'pass', 'test_verify.Verify.test_one_trap_is_rejected_and_the_other_waits_for_information'),
 ]
 
 

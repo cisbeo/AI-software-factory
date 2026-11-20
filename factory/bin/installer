@@ -30,7 +30,9 @@ there and writes nothing. Otherwise it applies the plan and nothing else:
   the install ends INCOMPLET.
 It writes the journal factory/install-log.json (factory version, source commit,
 pinned external sources, each file with its sha256, the labels it created).
-A second run only reports the differences.
+A second run only reports the differences. It ends INSTALL: POSÉE, never OK:
+the installation succeeds only once `factory verify` passes (spec §11.4), after
+the installed files are committed and merged into the base branch.
 
 uninstall — removes what the journal lists: created files are deleted, replaced
 files restored from their backup, created labels deleted. A file changed since
@@ -1012,7 +1014,9 @@ def cmd_install(args):
         say(f"INSTALL: INCOMPLET — non posés sans accord : {', '.join(declined)}")
         say(f"      Correction : relance avec --overwrite <chemin> pour chacun, ou réponds `o`")
         return 1
-    say("INSTALL: OK")
+    say("INSTALL: POSÉE — pas encore vérifiée")
+    say(f"      Suite : valide ces fichiers, fusionne-les dans {answers['base_branch']}, puis lance "
+        "factory verify ; l'installation n'est réussie qu'avec VERIFY: OK (spec §11.4)")
     return 0
 
 
