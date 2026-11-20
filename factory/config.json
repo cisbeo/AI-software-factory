@@ -6,6 +6,8 @@
   "max_duration_minutes": 480,
   "base_branch": "main",
   "merge_method": "merge",
+  "max_file_lines": 1500,
+  "max_file_bytes": 500000,
   "auto_merge": "never",
   "labels": {
     "queue": "factory",

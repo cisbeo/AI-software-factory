@@ -304,6 +304,106 @@ class Trailers(GateCase):
         self.assert_untraced(self.gate(), "only on a merge commit")
 
 
+class FileSize(GateCase):
+    """config `max_file_lines` and `max_file_bytes`: every file the branch adds
+    or modifies stays within both (spec §7.1, architecture rules). The message
+    says how to fix it."""
+
+    def setUp(self):
+        super().setUp()
+        self.config.update(max_file_lines=10, max_file_bytes=200)
+        self.write_config()
+        self.git(self.root, "add", "-A")
+        self.git(self.root, "commit", "-q", "-m", "limits")
+        self.git(self.root, "push", "-q", "origin", "HEAD:main")
+        self.git(self.worktree, "fetch", "-q", "origin")
+        self.git(self.worktree, "reset", "-q", "--hard", "origin/main")
+
+    def assert_oversized(self, res, *says):
+        self.assert_verdict(res, "FAIL")
+        md = self.checks_md()
+        self.assertIn("## File size", md)
+        for text in says:
+            self.assertIn(text, md)
+
+    # ---- blocked ----
+
+    def test_added_file_over_the_line_limit_fails_and_says_how_to_fix(self):
+        self.commit_on_branch({"src/big.py": "x = 1\n" * 11})
+        self.assert_oversized(self.gate(), "src/big.py: 11 lines", "max_file_lines 10", "Split it")
+        [t] = self.traces()
+        [hit] = t["file_size"]
+        self.assertIn("src/big.py", hit)
+
+    def test_modified_file_over_the_line_limit_fails(self):
+        self.commit_on_branch({"src/app.txt": "line\n" * 12})
+        self.assert_oversized(self.gate(), "src/app.txt: 12 lines")
+
+    def test_last_line_without_newline_counts(self):
+        self.commit_on_branch({"src/big.py": "x\n" * 10 + "y"})
+        self.assert_oversized(self.gate(), "src/big.py: 11 lines")
+
+    def test_file_over_the_byte_limit_fails(self):
+        self.commit_on_branch({"assets/blob.bin": "z" * 201})
+        self.assert_oversized(self.gate(), "assets/blob.bin: 201 bytes", "max_file_bytes 200")
+
+    def test_renamed_file_over_the_limit_fails(self):
+        write(self.root / "src" / "legacy.txt", "old\n" * 20)
+        self.git(self.root, "add", "-A")
+        self.git(self.root, "commit", "-q", "-m", "legacy")
+        self.git(self.root, "push", "-q", "origin", "HEAD:main")
+        self.git(self.worktree, "fetch", "-q", "origin")
+        self.git(self.worktree, "reset", "-q", "--hard", "origin/main")
+        self.git(self.worktree, "mv", "src/legacy.txt", "src/moved.txt")
+        self.commit_on_branch({})
+        self.assert_oversized(self.gate(), "src/moved.txt: 20 lines")
+
+    def test_oversized_file_fails_even_when_checks_are_inconclusive(self):
+        write(self.factory / "checks.sh", TEMPFAIL_CHECKS, mode=0o755)
+        self.commit_on_branch({"src/big.py": "x\n" * 11})
+        self.assert_oversized(self.gate(), "src/big.py")
+
+    # ---- neighbours that pass ----
+
+    def test_files_at_the_limits_pass(self):
+        self.commit_on_branch({"src/ten.py": "x\n" * 10, "assets/two-hundred.bin": "z" * 199 + "\n"})
+        res = self.gate()
+        self.assert_verdict(res, "PASS")
+        self.assertIn("File size: every changed file within 10 lines and 200 bytes", self.checks_md())
+        [t] = self.traces()
+        self.assertEqual(t["file_size"], [])
+
+    def test_untouched_or_deleted_big_files_pass(self):
+        write(self.root / "src" / "legacy.txt", "old\n" * 20)
+        write(self.root / "src" / "dead.txt", "old\n" * 20)
+        self.git(self.root, "add", "-A")
+        self.git(self.root, "commit", "-q", "-m", "legacy")
+        self.git(self.root, "push", "-q", "origin", "HEAD:main")
+        self.git(self.worktree, "fetch", "-q", "origin")
+        self.git(self.worktree, "reset", "-q", "--hard", "origin/main")
+        self.commit_on_branch({"src/app.txt": "v2\n", "src/dead.txt": None})
+        self.assert_verdict(self.gate(), "PASS")
+
+    # ---- input not understood: refused, never PASS ----
+
+    def test_unreadable_limits_are_refused(self):
+        self.commit_on_branch({"src/app.txt": "v2\n"})
+        for key in ("max_file_lines", "max_file_bytes"):
+            for value in ("10", 0, -1, 1.5, True, None, "missing"):
+                with self.subTest(key=key, value=value):
+                    config = dict(self.config)
+                    if value == "missing":
+                        config.pop(key)
+                    else:
+                        config[key] = value
+                    write(self.factory / "config.json", json.dumps(config))
+                    res = self.gate()
+                    self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+                    self.assertIn(f"config.json: {key}", res.stderr)
+                    self.assertNotIn("GATE: PASS", res.stdout)
+                    self.assertFalse(any(t["verdict"] == "PASS" for t in self.traces()))
+
+
 class Trace(GateCase):
     def test_pass_leaves_a_trace(self):
         head = self.commit_on_branch({"src/app.txt": "v2\n"})
