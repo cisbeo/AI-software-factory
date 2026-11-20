@@ -152,7 +152,10 @@ gate's `round-<N-1>/checks.md`, the reviews in `round-<N-1>/`, or
 **review.** Spawn every reviewer in `job.json` `agents.reviewers` **in one
 message**, so they run in parallel: `subagent_type` `reviewer-<r>`, model from
 the same map, prompt `<header> Review round <N>.` plus the port for `ux` and
-`ui`. **WAIT FOR ALL.** Each time one finishes, run
+`ui`, and nothing else: a reviewer works from the spec, the diff and the gate's
+evidence, never from the builder's account or reasoning (spec §7.3). Each
+review gives a verdict per acceptance criterion; `job` refuses one that
+doesn't. **WAIT FOR ALL.** Each time one finishes, run
 `factory/bin/job sync <id>` so the dashboard fills in. When every reviewer has
 finished:
 

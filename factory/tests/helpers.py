@@ -28,6 +28,32 @@ exit 1
 """
 
 
+SPEC_MD = """# Spec
+
+## Acceptance criteria
+1. `make a` writes a.txt.
+2. `make b` writes b.txt,
+   even when a.txt exists.
+3. `make c` fails with a message.
+
+## Out of scope
+1. Not a criterion.
+"""
+
+
+def review_md(verdict="PASS", n=3, fail=(), untested=None):
+    """A review file with one verdict per criterion of SPEC_MD (spec §7.3).
+    `untested`: None (no section), "none", or the criteria numbers no test exercises."""
+    lines = [f"VERDICT: {verdict}", "", "## Summary", "- fine", "", "## Criteria"]
+    lines += [f"{i}. {'FAIL' if i in fail else 'PASS'} — tests/test_x.py::test_{i} in checks.log"
+              for i in range(1, n + 1)]
+    if untested is not None:
+        lines += ["", "## Untested criteria"]
+        lines += ["None."] if untested == "none" else [f"- {i}: no test runs it" for i in untested]
+    lines += ["", "## Findings", "None.", ""]
+    return "\n".join(lines)
+
+
 def run(cmd, cwd=None, env=None, stdin=None):
     return subprocess.run(cmd, cwd=cwd, env=env, input=stdin, capture_output=True, text=True)
 

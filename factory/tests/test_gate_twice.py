@@ -16,7 +16,7 @@ unavailable) as many times as the number in `<ctl>/flaky`.
 import json
 import unittest
 
-from helpers import FactoryCase, write
+from helpers import SPEC_MD, FactoryCase, review_md, write
 
 JOB = "001-test"
 PR = 7
@@ -138,7 +138,8 @@ class MergeCase(FactoryCase):
 
     def approved(self):
         self.job("approve")
-        write(self.jobs / JOB / "round-1" / "review-code.md", "VERDICT: PASS\n\nFine.\n")
+        write(self.jobs / JOB / "round-1" / "review-code.md", review_md())
+        write(self.jobs / JOB / "spec.md", SPEC_MD)
         write(self.jobs / JOB / "decision.md", "APPROVE\n\nFine.\n")
 
     def main_moves(self, files):
@@ -276,7 +277,8 @@ class FirstGate(MergeCase):
 
     def reviewed_job(self):
         self.job("review")
-        write(self.jobs / JOB / "round-1" / "review-code.md", "VERDICT: PASS\n\nFine.\n")
+        write(self.jobs / JOB / "round-1" / "review-code.md", review_md())
+        write(self.jobs / JOB / "spec.md", SPEC_MD)
 
     # ---- blocked ----
 
