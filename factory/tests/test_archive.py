@@ -154,6 +154,29 @@ class SecretDetector(ArchiveCase):
         # The workstation copy is left as it was.
         self.assertIn(GITHUB_TOKEN, (d / "build.md").read_text())
 
+    def test_title_is_masked_in_the_manifest(self):
+        d = self.merged_job()
+        job = json.loads((d / "job.json").read_text())
+        job["title"] = f"Rotate {GITHUB_TOKEN}"
+        write(d / "job.json", json.dumps(job))
+        self.assertEqual(self.advance().returncode, 0)
+        self.assertNotIn(GITHUB_TOKEN, self.archived("ARCHIVE.md"))
+        self.assertNotIn(GITHUB_TOKEN, self.archived("job.json"))
+
+    def test_links_are_not_followed(self):
+        d = self.merged_job()
+        outside = self.tmp / "outside.md"
+        write(outside, "workstation secret file\n")
+        (d / "spec.md").unlink()
+        (d / "spec.md").symlink_to(outside)
+        (d / "round-2").symlink_to(self.tmp, target_is_directory=True)
+        write(self.tmp / "review-code.md", "outside the folder\n")
+        self.assertEqual(self.advance().returncode, 0)
+        names = self.archived_names()
+        self.assertNotIn(f"jobs/{JOB}/spec.md", names)
+        self.assertFalse([n for n in names if "round-2" in n])
+        self.assertIn("- spec.md", self.archived("ARCHIVE.md"))
+
     def test_prose_about_secrets_is_kept(self):
         d = self.merged_job()
         prose = ("The token: none was given. The secret detector runs first.\n"

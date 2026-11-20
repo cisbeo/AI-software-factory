@@ -984,7 +984,9 @@ def archive_files(job):
     files, masks, left = {}, [], []
     for path in sorted(p for p in d.rglob("*") if p.is_file()):
         rel = path.relative_to(d).as_posix()
-        if not ARCHIVED.fullmatch(rel):
+        # A link planted in the folder could point anywhere on the workstation.
+        inside = not path.is_symlink() and Path(os.path.realpath(path)).is_relative_to(os.path.realpath(d))
+        if not ARCHIVED.fullmatch(rel) or not inside:
             left.append(rel)
             continue
         if rel == "job.json":
@@ -994,7 +996,7 @@ def archive_files(job):
         text, found = mask_secrets(text)
         masks += [f"- {rel}:{line}: {rule}" for line, rule in found]
         files[rel] = text.encode()
-    files["ARCHIVE.md"] = "\n".join([
+    manifest = "\n".join([
         f"# Archive of job {job['id']}",
         "",
         f"Issue #{job['issue']}: {job['title']}. Merge request #{job['pr']}, merged {job['ended']}.",
@@ -1010,7 +1012,8 @@ def archive_files(job):
         "",
         *([f"- {rel}" for rel in left if rel != ".lock"] or ["None."]),
         "",
-    ]).encode()
+    ])
+    files["ARCHIVE.md"] = mask_secrets(manifest)[0].encode()  # the title is free text
     return files
 
 
@@ -1018,7 +1021,8 @@ def plumbing(*args, env=None, stdin=None):
     res = subprocess.run(["git", *args], cwd=REPO, capture_output=True, env=env,
                          input=stdin.encode() if isinstance(stdin, str) else stdin)
     if res.returncode != 0:
-        raise Refused(f"archive: `git {' '.join(args)}` failed: {res.stderr.decode(errors='replace').strip()}")
+        raise Refused(f"archive: `git {' '.join(args)}` failed: "
+                      f"{mask_secrets(res.stderr.decode(errors='replace').strip())[0]}")
     return res.stdout.decode().strip()
 
 
@@ -1056,7 +1060,7 @@ def archive(job):
         if pushed.returncode == 0:
             subprocess.run(["git", "update-ref", remote, commit], cwd=REPO, capture_output=True)
             return commit
-    raise Refused(f"archive: pushing {branch} to origin failed: {pushed.stderr.strip()}")
+    raise Refused(f"archive: pushing {branch} to origin failed: {mask_secrets(pushed.stderr.strip())[0]}")
 
 
 def purge_raw_logs():

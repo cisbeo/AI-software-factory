@@ -139,6 +139,8 @@ MUTATIONS = [
  ("job: rétention malformée acceptée", "factory/bin/job", 'require(is_number(value, integer=True) and value > 0,\n            f"config.json: raw_log_retention_days', 'require(True,\n            f"config.json: raw_log_retention_days', "test_archive.Retention"),
  ("job: second parent d'une fusion ignoré", "factory/bin/job", 'candidates = [commit] + plumbing(', 'candidates = [commit] + 0 * plumbing(', "test_archive.Lookup"),
  ("job: deux jobs pour un commit acceptés", "factory/bin/job", 'if len(ids) > 1:', 'if False:', "test_archive.Lookup"),
+ ("job: lien symbolique suivi dans l'archive", "factory/bin/job", 'if not ARCHIVED.fullmatch(rel) or not inside:', 'if not ARCHIVED.fullmatch(rel):', "test_archive.SecretDetector"),
+ ("job: manifeste sans masque", "factory/bin/job", 'files["ARCHIVE.md"] = mask_secrets(manifest)[0].encode()', 'files["ARCHIVE.md"] = manifest.encode()', "test_archive.SecretDetector"),
  ("guard: push vers l'archive accepté", ".claude/hooks/guard.py", 'require(archive not in dsts,', 'require(True,', "test_archive.HookArchiveBranch"),
 ]
 
