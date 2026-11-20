@@ -535,6 +535,12 @@ class ForgeContract(unittest.TestCase):
     def test_ticket_close_of_a_missing_ticket_fails_cleanly(self):
         self.forge_fails("ticket", "close", "99999")
 
+    def test_ticket_close_refuses_a_merge_request_number(self):
+        n, _ = self.world.mr()
+        res = self.forge_fails("ticket", "close", str(n))
+        self.assertIn("demande de fusion", res.stderr)
+        self.assertEqual(self.world.mr_field(n, "state"), "open")
+
     # ---- merge requests -----------------------------------------------------
 
     def test_mr_create_opens_a_draft_found_by_its_branch(self):

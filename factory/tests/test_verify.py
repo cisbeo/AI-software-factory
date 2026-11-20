@@ -291,6 +291,21 @@ class Preconditions(VerifyCase):
         self.assertIn("Correction :", res.stdout)
         self.assertEqual(self.issues(), [])
 
+    def test_claude_configuration_beyond_the_install_is_refused(self):
+        for rel in (".claude/settings.local.json", ".mcp.json"):
+            write(self.target / rel, "{}\n")
+            res = self.refused(self.verify(), "VERIFY: FAIL", "configuration Claude hors de la factory", rel)
+            self.assertIn("Correction :", res.stdout)
+            (self.target / rel).unlink()
+        self.assertEqual(self.issues(), [])
+
+    def test_caps_the_sessions_cannot_read_are_refused(self):
+        config = json.loads((self.target / "factory/config.json").read_text())
+        config["max_cost_usd"] = "1e9"
+        self.commit_on_main("factory/config.json", json.dumps(config, indent=2) + "\n")
+        self.refused(self.verify(), "VERIFY: FAIL", "max_cost_usd")
+        self.assertEqual(self.issues(), [])
+
     def test_a_component_changed_since_install_is_refused(self):
         gate = self.target / "factory/bin/gate"
         self.commit_on_main("factory/bin/gate", gate.read_text() + "\n# local change\n")

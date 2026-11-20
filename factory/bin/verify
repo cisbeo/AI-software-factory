@@ -102,6 +102,13 @@ def check_target(target):
         config = json.loads((target / "factory/config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         fail(f"factory/config.json illisible ({e})", "relance factory install")
+    num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+    for key in ("max_cost_usd", "max_duration_minutes"):
+        if not num(config.get(key)):
+            fail(f"factory/config.json : {key} vaut {config.get(key)!r}, attendu un nombre > 0",
+                 "corrige factory/config.json (ou relance factory install)")
+    if not isinstance((config.get("labels") or {}).get("queue"), str) or not isinstance(config.get("base_branch"), str):
+        fail("factory/config.json : labels.queue ou base_branch incompris", "relance factory install")
     if config.get("auto_merge", "never") != "never":
         fail(f"auto_merge vaut {config['auto_merge']!r} dans factory/config.json : le ticket factice serait fusionné",
              "remets auto_merge à never le temps de la vérification")
@@ -118,6 +125,16 @@ def check_target(target):
         shown = subprocess.run(["git", "show", f"origin/{base}:{it.path}"], cwd=target, capture_output=True)
         if shown.returncode != 0 or shown.stdout != it.data:
             on_base.append(it.path)
+    # Deny by default what Claude Code loads from the repository: anything under
+    # .claude/ that the pinned commit doesn't pose (settings.local.json, extra
+    # hooks, agents, skills) and project MCP servers could relax the deny rules.
+    posed = {it.path for it in inst.component_items(commit)}
+    extra = sorted(str(p.relative_to(target)) for p in (target / ".claude").rglob("*")
+                   if (p.is_file() or p.is_symlink()) and str(p.relative_to(target)) not in posed)
+    extra += [n for n in (".mcp.json",) if (target / n).exists() or (target / n).is_symlink()]
+    if extra:
+        fail(f"configuration Claude hors de la factory installée : {listing(extra)} ; les sessions sans "
+             "surveillance la chargeraient", "retire ces fichiers (ou déplace-les hors du dépôt), puis relance factory verify")
     if on_disk:
         fail(f"composants installés différents du commit {commit[:12]} de la factory : {listing(on_disk)}",
              f"relance factory install depuis ce commit (journal : {journal['source_commit'][:12]}), "

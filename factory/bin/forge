@@ -252,7 +252,8 @@ class GitHub(Forge):
                     raise
 
     def ticket_close(self, number):
-        self.issue(number)
+        if "pull_request" in self.issue(number):
+            raise ForgeError(f"#{number} est une demande de fusion, pas un ticket")
         self.api("PATCH", f"issues/{int(number)}", {"state": "closed", "state_reason": "not_planned"})
 
     # ---- merge requests ----
