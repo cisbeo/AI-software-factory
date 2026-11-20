@@ -14,7 +14,10 @@ Usage:
   job create <issue>             new job for an open `factory` issue; prints the job id
   job advance <job> <stage>      move a job to <stage>, or refuse
   job merge <job>                APPROVE → sync with the base branch, gate, merge the PR
-                                 (only if config auto_merge allows it; otherwise → needs-human)
+                                 (only if config auto_merge allows it; otherwise → needs-human).
+                                 The gate runs twice (spec §7.1): review → approve and the sync
+                                 need HEAD to be the commit round-N/checks.md passed; after the
+                                 sync, only the commit round-N/merge-checks.md says PASS for is merged
   job feedback <job>             needs-human → build, with your feedback (stdin) as feedback-<k>.md
   job reject <job>               needs-info or needs-human → rejected, with your reason (stdin) as rejection.md
   job agents <job> <json>        record the routed agent set (called by factory/bin/route)
@@ -531,6 +534,22 @@ def check_reviews_done(job):
     require(not bad, f"first line isn't a verdict in review-{bad[0]}.md" if bad else "")
 
 
+def gated_commit(job, name="checks"):
+    """The commit round-N/<name>.md says the gate passed, or None when the file
+    is missing, unreadable, or says anything but GATE: PASS."""
+    path = round_dir(job) / f"{name}.md"
+    h = header(path) if path.exists() else {}
+    commit = h.get("COMMIT", "")
+    return commit if h.get("GATE") == "PASS" and re.fullmatch(r"[0-9a-f]{40}", commit) else None
+
+
+def branch_heads(job):
+    """(local HEAD, origin tip) of the job's branch, after a fetch."""
+    git(job, "fetch", "origin", job["branch"], check=False)
+    res = git(job, "rev-parse", f"origin/{job['branch']}", check=False)
+    return git(job, "rev-parse", "HEAD").stdout.strip(), res.stdout.strip() if res.returncode == 0 else ""
+
+
 def next_round(job):
     job["round"] += 1
     round_dir(job).mkdir(exist_ok=True)
@@ -662,6 +681,12 @@ def advance(job, stage):
         changes = [r for r, v in job["reviews"].items() if v == "CHANGES"]
         if stage == "approve":
             require(not changes, f"reviews want CHANGES: {', '.join(changes)}")
+            # The reviews judged the commit the first gate passed, and nothing else (spec §7.1).
+            gated, heads = gated_commit(job), branch_heads(job)
+            require(gated and all(h == gated for h in heads),
+                    f"{heads[0][:7]} isn't the commit the gate passed before the reviews "
+                    f"(round-{job['round']}/checks.md: {gated[:7] if gated else 'no GATE: PASS'}); "
+                    "send the job back through the gate")
         else:
             require(changes, "every review passed")
             n = job["round"]
@@ -975,6 +1000,13 @@ def cmd_merge(job):
         save(advance(sync(job), "needs-human"))
         print(f"{job['id']}: needs-human: {why.splitlines()[0]}")
 
+    # Only the commit the reviews judged may be synced and merged (spec §7.1).
+    gated, heads = gated_commit(job), branch_heads(job)
+    late = next((h for h in heads if h != gated), None)
+    if not gated or late is not None:
+        return fail(f"{(late or '?')[:7]} isn't the commit the gate passed before the reviews "
+                    f"(round-{job['round']}/checks.md: {gated[:7] if gated else 'no GATE: PASS'}). "
+                    "It was never reviewed: send the job back through the gate and the reviews.")
     git(job, "fetch", "origin", BASE)
     merged = git(job, "merge", "--no-ff", "--no-edit", "-m",
                  f"Merge origin/{BASE} into {job['branch']}\n\n{trailer_text(job, SCRIPT_AGENT, 'none')}",
@@ -982,7 +1014,9 @@ def cmd_merge(job):
     if merged.returncode != 0:
         git(job, "merge", "--abort", check=False)
         return fail(f"The branch conflicts with {BASE}:\n\n```\n{merged.stdout.strip()}\n```")
+    merge_checks = round_dir(job) / "merge-checks.md"
     for _ in range(2):  # an INCONCLUSIVE gate (exit 3) runs once more, then escalates
+        merge_checks.unlink(missing_ok=True)  # a verdict from an earlier attempt proves nothing
         gate = subprocess.run([str(BIN / "gate"), job["id"], "--merge"], capture_output=True, text=True)
         if gate.returncode != 3:
             break
@@ -992,11 +1026,15 @@ def cmd_merge(job):
     if gate.returncode != 0:
         return fail(f"The gate failed after syncing with {BASE}. "
                     f"See round-{job['round']}/merge-checks.md.\n\n{gate.stdout.strip()}")
+    # Trust merge-checks.md, not the exit code: it must say PASS for HEAD.
+    head = git(job, "rev-parse", "HEAD").stdout.strip()
+    if gated_commit(job, "merge-checks") != head:
+        return fail(f"The gate exited 0 after syncing with {BASE}, but round-{job['round']}/merge-checks.md "
+                    f"doesn't say GATE: PASS for {head[:7]}. Nothing was merged.\n\n{gate.stdout.strip()}")
     try:
         git(job, "push", "origin", job["branch"])
         # Merge only the commit the gate just checked: the forge refuses if the
         # request's head moved since.
-        head = git(job, "rev-parse", "HEAD").stdout.strip()
         forge("mr", "ready", job["pr"])
         forge("mr", "merge", job["pr"], "--head", head, "--method", CONFIG["merge_method"])
     except Refused as e:
